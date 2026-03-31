@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Face Studio — count &amp; recognize</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}" />
+</head>
+<body>
+  <div class="bg-scene" aria-hidden="true">
+    <div class="bg-scene__glow bg-scene__glow--1"></div>
+    <div class="bg-scene__glow bg-scene__glow--2"></div>
+    <div class="bg-scene__glow bg-scene__glow--3"></div>
+    <div class="bg-scene__grid"></div>
+  </div>
+
+  <div class="shell">
+    <header class="hero">
+      <div class="hero__badge">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+          <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+        </svg>
+        Local toolkit
+      </div>
+      <h1 class="hero__title">Face Studio</h1>
+      <p class="hero__lead">
+        Count people in a photo with <strong>face_recognition</strong>, or identify a face against your
+        <strong>known_faces</strong> gallery with OpenCV LBPH. One clean workspace for both flows.
+      </p>
+      <div class="hero__paths">
+        <span class="path-chip path-chip--count">HOG / CNN counting</span>
+        <span class="path-chip path-chip--rec">Cached LBPH model</span>
+      </div>
+      <div class="hero__meta">
+        <span>Data <code>{{ data_dir }}</code></span>
+        <span>Cache <code>{{ model_cache }}</code></span>
+      </div>
+      <div class="hero__actions">
+        <button type="button" id="btnRetrain" class="btn warn">Rebuild model cache</button>
+        <span id="retrainMsg"></span>
+      </div>
+    </header>
+
+    <main class="grid">
+      <section class="card card--count">
+        <div class="card__head">
+          <div class="card__icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="9" cy="7" r="3"/><circle cx="17" cy="7" r="2.5"/>
+              <path d="M3 21v-1a5 5 0 015-5h4a5 5 0 015 5v1M17 11h.5a2.5 2.5 0 012.5 2.5V21"/>
+            </svg>
+          </div>
+          <div>
+            <h2>Count faces</h2>
+            <p class="card__sub">Detect every face in an image. Large files are resized first for speed.</p>
+          </div>
+        </div>
+        <p class="hint">Drop a file or click to browse. Output shows the total and an overlay preview.</p>
+        <label class="drop">
+          <input type="file" id="countFile" accept="image/png,image/jpeg,image/webp" />
+          <span class="drop__inner">
+            <span class="drop__label">Choose or drop an image</span>
+            <span class="drop__hint">PNG, JPEG, WebP</span>
+          </span>
+        </label>
+        <div id="countResult" class="result" aria-live="polite"></div>
+        <div id="countPreview" class="preview"></div>
+      </section>
+
+      <section class="card card--rec">
+        <div class="card__head">
+          <div class="card__icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="3" width="18" height="18" rx="2"/>
+              <circle cx="12" cy="10" r="3"/>
+              <path d="M7 19.5c0-2.5 2.5-4 5-4s5 1.5 5 4"/>
+            </svg>
+          </div>
+          <div>
+            <h2>Recognize</h2>
+            <p class="card__sub">Upload a clear frontal face. You get the most likely name and a reference crop.</p>
+          </div>
+        </div>
+        <p class="hint">Works best with one dominant face and decent lighting.</p>
+        <label class="drop">
+          <input type="file" id="recFile" accept="image/png,image/jpeg,image/webp" />
+          <span class="drop__inner">
+            <span class="drop__label">Choose or drop a portrait</span>
+            <span class="drop__hint">PNG, JPEG, WebP</span>
+          </span>
+        </label>
+        <div id="recResult" class="result" aria-live="polite"></div>
+        <div id="recBig" class="preview resultBig"></div>
+        <div class="recRow">
+          <div id="recThumb" class="preview thumb"></div>
+        </div>
+      </section>
+
+      <section class="card wide card--cam">
+        <div class="card__head">
+          <div class="card__icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2z"/>
+              <circle cx="12" cy="13" r="4"/>
+            </svg>
+          </div>
+          <div>
+            <h2>Webcam snapshot</h2>
+            <p class="card__sub">Preview locally, then capture a single frame. No streaming loop to the server.</p>
+          </div>
+        </div>
+        <p class="hint">
+          Open the camera, frame your face, then <strong>Capture &amp; identify</strong>. The result appears on the right with a reference image.
+        </p>
+        <div class="row">
+          <button type="button" id="btnCamOpen" class="btn primary">Open camera</button>
+          <button type="button" id="btnCapture" class="btn" disabled>Capture &amp; identify</button>
+          <button type="button" id="btnCamClose" class="btn btn-ghost" disabled>Close</button>
+        </div>
+        <div class="camRow">
+          <div class="camWrap">
+            <video id="cam" playsinline muted></video>
+          </div>
+          <div class="camResult">
+            <p id="snapStatus" class="status"></p>
+            <div id="snapBig" class="preview resultBig"></div>
+            <p id="snapName" class="snapName"></p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <p class="footer-note">Runs on your machine — images are sent only to your local Flask server.</p>
+  </div>
+
+  <canvas id="snap" hidden></canvas>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    function loadingHtml(text) {
+      return `<span class="result--loading"><span class="spinner" aria-hidden="true"></span>${text}</span>`;
+    }
+
+    async function postFile(url, file, fieldName = "image") {
+      const fd = new FormData();
+      fd.append(fieldName, file, file.name || "upload.jpg");
+      const res = await fetch(url, { method: "POST", body: fd });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      return data;
+    }
+
+    $("btnRetrain").addEventListener("click", async () => {
+      $("retrainMsg").textContent = "";
+      $("btnRetrain").disabled = true;
+      try {
+        const res = await fetch("/api/retrain", { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || res.statusText);
+        $("retrainMsg").textContent = "Cache updated · " + (data.mode || "ok");
+        $("retrainMsg").style.color = "";
+      } catch (e) {
+        $("retrainMsg").textContent = e.message;
+        $("retrainMsg").style.color = "var(--danger)";
+      } finally {
+        $("btnRetrain").disabled = false;
+      }
+    });
+
+    $("countFile").addEventListener("change", async (e) => {
+      const f = e.target.files[0];
+      if (!f) return;
+      $("countResult").innerHTML = loadingHtml("Analyzing…");
+      $("countPreview").innerHTML = "";
+      try {
+        const data = await postFile("/api/count", f);
+        $("countResult").innerHTML = `
+          <div class="stat-pill">
+            <span class="stat-pill__val">${data.count}</span>
+            <span class="stat-pill__lbl">faces found</span>
+          </div>`;
+        $("countPreview").innerHTML = `<img src="${data.image}" alt="Annotated preview with face regions" />`;
+      } catch (err) {
+        $("countResult").innerHTML = `<div class="result--error">${err.message}</div>`;
+      }
+    });
+
+    $("recFile").addEventListener("change", async (e) => {
+      const f = e.target.files[0];
+      if (!f) return;
+      $("recResult").innerHTML = loadingHtml("Matching…");
+      $("recBig").innerHTML = "";
+      $("recThumb").innerHTML = "";
+      try {
+        const data = await postFile("/api/recognize", f);
+        if (!data.face_found) {
+          $("recResult").innerHTML = `<div class="result--error">${data.message || "No face detected."}</div>`;
+          return;
+        }
+        $("recResult").innerHTML = `
+          <div class="result-panel">
+            <div class="result-panel__title">${data.verdict}</div>
+            <div class="result-panel__meta">LBPH distance ${data.distance.toFixed(1)} · lower is closer to the reference</div>
+          </div>`;
+        if (data.reference_large) {
+          $("recBig").innerHTML = `
+            <p class="thumbLabel">Reference from training set</p>
+            <img src="${data.reference_large}" alt="Best matching reference face" />`;
+        }
+        if (data.similar_thumb) {
+          $("recThumb").innerHTML = `
+            <p class="thumbLabel">Crop</p>
+            <img src="${data.similar_thumb}" alt="Thumbnail" />
+            <p class="muted tiny">${data.similar_training_file || ""}</p>`;
+        }
+      } catch (err) {
+        $("recResult").innerHTML = `<div class="result--error">${err.message}</div>`;
+      }
+    });
+
+    function wireDropZone(labelEl, inputEl) {
+      ["dragenter", "dragover"].forEach((ev) => {
+        labelEl.addEventListener(ev, (e) => {
+          e.preventDefault();
+          labelEl.classList.add("drop--active");
+        });
+      });
+      labelEl.addEventListener("dragleave", () => labelEl.classList.remove("drop--active"));
+      labelEl.addEventListener("drop", (e) => {
+        e.preventDefault();
+        labelEl.classList.remove("drop--active");
+        const f = e.dataTransfer.files[0];
+        if (!f || !/^image\//.test(f.type)) return;
+        const dt = new DataTransfer();
+        dt.items.add(f);
+        inputEl.files = dt.files;
+        inputEl.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+    }
+    document.querySelectorAll(".card--count .drop, .card--rec .drop").forEach((label) => {
+      const input = label.querySelector('input[type="file"]');
+      if (input) wireDropZone(label, input);
+    });
+
+    const video = $("cam");
+    const canvas = $("snap");
+    const ctx = canvas.getContext("2d");
+    let stream = null;
+
+    $("btnCamOpen").addEventListener("click", async () => {
+      $("snapStatus").textContent = "";
+      $("snapStatus").classList.remove("status--ok");
+      $("snapBig").innerHTML = "";
+      $("snapName").textContent = "";
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
+          audio: false,
+        });
+        video.srcObject = stream;
+        await video.play();
+        $("btnCamOpen").disabled = true;
+        $("btnCapture").disabled = false;
+        $("btnCamClose").disabled = false;
+        $("snapStatus").textContent = "Camera ready — position yourself, then capture.";
+      } catch (e) {
+        $("snapStatus").textContent = "Camera error: " + e.message;
+      }
+    });
+
+    $("btnCamClose").addEventListener("click", () => {
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+      stream = null;
+      video.srcObject = null;
+      $("btnCamOpen").disabled = false;
+      $("btnCapture").disabled = true;
+      $("btnCamClose").disabled = true;
+      $("snapStatus").classList.remove("status--ok");
+      $("snapStatus").textContent = "Camera closed.";
+    });
+
+    $("btnCapture").addEventListener("click", async () => {
+      if (!video.videoWidth) return;
+      const maxW = 640;
+      let w = video.videoWidth;
+      let h = video.videoHeight;
+      if (w > maxW) {
+        h = Math.round((h * maxW) / w);
+        w = maxW;
+      }
+      canvas.width = w;
+      canvas.height = h;
+      ctx.drawImage(video, 0, 0, w, h);
+      const blob = await new Promise((r) => canvas.toBlob(r, "image/jpeg", 0.82));
+      if (!blob) return;
+      $("snapStatus").innerHTML = loadingHtml("Identifying…");
+      $("snapStatus").classList.remove("status--ok");
+      try {
+        const data = await postFile("/api/snapshot_identify", blob, "image");
+        if (!data.face_found) {
+          $("snapStatus").innerHTML = data.message || "No face in frame.";
+          $("snapStatus").classList.remove("status--ok");
+          $("snapBig").innerHTML = "";
+          $("snapName").textContent = "";
+          return;
+        }
+        $("snapStatus").textContent = data.verdict;
+        $("snapStatus").classList.add("status--ok");
+        $("snapName").innerHTML = `<strong>${data.name}</strong> · distance ${data.distance.toFixed(1)}`;
+        if (data.reference_large) {
+          $("snapBig").innerHTML = `<img src="${data.reference_large}" alt="Identified reference" />`;
+        }
+      } catch (e) {
+        $("snapStatus").textContent = e.message;
+        $("snapStatus").classList.remove("status--ok");
+      }
+    });
+  </script>
+</body>
+</html>

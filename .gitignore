@@ -1,0 +1,16 @@
+# LBPH / OpenCV face model cache (generated locally; often > 100 MB — do not commit)
+data/.lbph_cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+
+# Annotated outputs from face_count CLI
+output/

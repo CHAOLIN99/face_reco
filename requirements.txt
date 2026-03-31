@@ -1,5 +1,6 @@
-opencv-python
+opencv-contrib-python
 face-recognition
 numpy
 pillow
+flask
 setuptools<82
