@@ -2,7 +2,7 @@
 Web UI: face counting + recognition with cached LBPH model.
 
   python app.py
-  open http://127.0.0.1:5050
+  open the URL printed in the terminal (default starts at 5050; next free port if busy).
 
 Env:
   FACE_REC_DATA_DIR       default ``data``
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import os
+import socket
 import tempfile
 from pathlib import Path
 
@@ -46,7 +47,9 @@ def get_counter() -> FaceCounterSystem:
     global _counter
     if _counter is None:
         model = os.environ.get("FACE_COUNT_MODEL", "hog")
-        _counter = FaceCounterSystem(model=model)
+        sens = os.environ.get("FACE_COUNT_SENSITIVE", "0").lower()
+        sensitive = sens not in ("0", "false", "no")
+        _counter = FaceCounterSystem(model=model, sensitive_counting=sensitive)
     return _counter
 
 
@@ -240,7 +243,32 @@ def api_snapshot_identify():
         return jsonify({"error": str(e)}), 503
 
 
+def _resolve_run_port() -> int:
+    """Use PORT if set; else first free port in 5050–5079; else OS ephemeral port on loopback."""
+    if "PORT" in os.environ:
+        return int(os.environ["PORT"])
+    preferred = 5050
+    for p in range(preferred, preferred + 30):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("127.0.0.1", p))
+                return p
+            except OSError:
+                continue
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", 0))
+            return int(s.getsockname()[1])
+        except OSError as e:
+            raise RuntimeError(
+                "Could not bind to 127.0.0.1 (ports 5050–5079 and ephemeral port all failed); "
+                "set PORT to a free port."
+            ) from e
+
+
 if __name__ == "__main__":
-    # Default 5050: macOS often reserves 5000 for AirPlay Receiver.
-    port = int(os.environ.get("PORT", "5050"))
+    port = _resolve_run_port()
+    print(f"\n  Face Studio → http://127.0.0.1:{port}/\n")
     app.run(host="127.0.0.1", port=port, debug=True)
