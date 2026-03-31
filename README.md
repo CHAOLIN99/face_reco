@@ -80,7 +80,7 @@ source .venv/bin/activate
 python app.py
 ```
 
-Open **http://127.0.0.1:5050** in your browser (default port is **5050** because macOS often uses **5000** for AirPlay Receiver).
+Open the URL printed in the terminal (defaults to **5050**; if that port is busy, the app picks the next free one). macOS often uses **5000** for AirPlay Receiver, so this project avoids 5000 by default.
 
 ### What you can do in the UI
 
@@ -99,7 +99,8 @@ Open **http://127.0.0.1:5050** in your browser (default port is **5050** because
 | `FACE_DETECT_DOWNSCALE` | `0.45` | Haar runs on a resized frame for speed (0.3–0.6 typical). |
 | `FACE_REC_FORCE_RETRAIN` | unset | Set to `1` / `true` to ignore cache on next load (also used internally by retrain API). |
 | `FACE_COUNT_MODEL` | `hog` | `hog` (CPU-friendly) or `cnn` (heavier; better quality if you have GPU support). |
-| `PORT` | `5050` | HTTP port for Flask. Use another value if the port is busy (`export PORT=8000`). |
+| `FACE_COUNT_SENSITIVE` | `0` | `1` / `true`: larger image + 2× upsample for small/distant faces (still dlib-only; fewer false positives than older Haar merge). |
+| `PORT` | (unset) | If unset, Flask tries 5050–5079, then an ephemeral port on loopback. Set explicitly (e.g. `export PORT=8000`) to force one port (fails if in use). |
 
 Example:
 

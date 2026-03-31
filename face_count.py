@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import face_recognition
@@ -9,40 +9,62 @@ import numpy as np
 
 class FaceCounterSystem:
     """
-    Face counting with the ``face_recognition`` library (HOG or CNN).
+    Face counting with ``face_recognition`` (dlib HOG or CNN) only — no Haar merge,
+    to avoid counting non-face patterns.
 
-    Prefer ``hog`` on CPU (default). Use ``cnn`` only with GPU / when accuracy matters more than speed.
+    **Default (strict):** moderate resize + single upsample — fewer false positives.
+    **Sensitive mode** (``sensitive_counting=True`` or ``FACE_COUNT_SENSITIVE=1``):
+    keeps more resolution and uses higher upsampling for small / distant faces;
+    still dlib-only (may miss some faces vs CNN).
     """
 
-    def __init__(self, model: str = "hog"):
+    DEFAULT_MAX_SIDE_SENSITIVE = 4096
+    HARD_MAX_SIDE = 8000
+    DEFAULT_UPSAMPLE_SENSITIVE = 2
+    DEFAULT_MAX_SIDE_FAST = 1600
+    DEFAULT_UPSAMPLE_FAST = 1
+
+    def __init__(self, model: str = "hog", *, sensitive_counting: bool = False):
         if model not in ("hog", "cnn"):
             raise ValueError("model must be 'hog' or 'cnn'")
         self.model = model
+        self.sensitive_counting = sensitive_counting
 
     @staticmethod
     def _load_rgb(path: str) -> np.ndarray:
         return face_recognition.load_image_file(path)
+
+    def _locations_hog_cnn(
+        self,
+        rgb: np.ndarray,
+        *,
+        upsample: int,
+    ) -> List[Tuple[int, int, int, int]]:
+        return list(
+            face_recognition.face_locations(
+                rgb,
+                number_of_times_to_upsample=upsample,
+                model=self.model,
+            )
+        )
 
     def _locations(
         self,
         rgb: np.ndarray,
         *,
         upsample: int,
-    ) -> list:
-        return face_recognition.face_locations(
-            rgb,
-            number_of_times_to_upsample=upsample,
-            model=self.model,
-        )
+    ) -> List[Tuple[int, int, int, int]]:
+        return self._locations_hog_cnn(rgb, upsample=upsample)
 
     def _annotate_bgr(
         self,
         rgb: np.ndarray,
-        face_locations: list,
+        face_locations: Sequence[Tuple[int, int, int, int]],
         *,
         draw_block: bool,
         block_alpha: float,
     ) -> Tuple[int, np.ndarray]:
+        face_locations = list(face_locations)
         count = len(face_locations)
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         overlay = bgr.copy()
@@ -63,18 +85,47 @@ class FaceCounterSystem:
         cv2.putText(bgr, label, (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
         return count, bgr
 
+    def _defaults_for_count(self) -> Tuple[int, int]:
+        if self.sensitive_counting:
+            return self.DEFAULT_UPSAMPLE_SENSITIVE, self.DEFAULT_MAX_SIDE_SENSITIVE
+        return self.DEFAULT_UPSAMPLE_FAST, self.DEFAULT_MAX_SIDE_FAST
+
+    @staticmethod
+    def _maybe_downscale_rgb(
+        rgb: np.ndarray,
+        max_side: int,
+        hard_cap: int = HARD_MAX_SIDE,
+    ) -> np.ndarray:
+        """
+        Shrink only when the longest side exceeds max_side.
+        ``max_side <= 0`` means skip downscale except ``hard_cap`` safety limit.
+        """
+        h, w = rgb.shape[:2]
+        m = max(h, w)
+        limit = max_side if max_side > 0 else hard_cap
+        if m <= limit:
+            return rgb
+        scale = limit / m
+        nw, nh = int(w * scale), int(h * scale)
+        return cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_AREA)
+
     def count_faces_in_image(
         self,
         image_path: str,
         output_dir: str = "output",
-        upsample: int = 1,
+        upsample: Optional[int] = None,
         draw_block: bool = True,
         block_alpha: float = 0.55,
+        max_side: Optional[int] = None,
     ) -> int:
         os.makedirs(output_dir, exist_ok=True)
+        d_up, d_side = self._defaults_for_count()
+        up = d_up if upsample is None else upsample
+        side = d_side if max_side is None else max_side
+
         rgb = self._load_rgb(image_path)
-        rgb = self._maybe_downscale_rgb(rgb)
-        locs = self._locations(rgb, upsample=upsample)
+        rgb = self._maybe_downscale_rgb(rgb, side)
+        locs = self._locations(rgb, upsample=up)
         count, bgr = self._annotate_bgr(rgb, locs, draw_block=draw_block, block_alpha=block_alpha)
         output_path = os.path.join(output_dir, f"count_{Path(image_path).name}")
         cv2.imwrite(output_path, bgr)
@@ -84,41 +135,46 @@ class FaceCounterSystem:
     def count_faces_in_image_annotated(
         self,
         image_path: str,
-        upsample: int = 1,
+        upsample: Optional[int] = None,
         draw_block: bool = True,
         block_alpha: float = 0.55,
-        max_side: int = 1600,
+        max_side: Optional[int] = None,
     ) -> tuple[int, np.ndarray]:
-        """Return ``(count, annotated_bgr)`` without writing to disk."""
+        d_up, d_side = self._defaults_for_count()
+        up = d_up if upsample is None else upsample
+        side = d_side if max_side is None else max_side
+
         rgb = self._load_rgb(image_path)
-        rgb = self._maybe_downscale_rgb(rgb, max_side=max_side)
-        locs = self._locations(rgb, upsample=upsample)
+        rgb = self._maybe_downscale_rgb(rgb, side)
+        locs = self._locations(rgb, upsample=up)
         return self._annotate_bgr(rgb, locs, draw_block=draw_block, block_alpha=block_alpha)
 
     def count_faces_in_rgb(
         self,
         rgb: np.ndarray,
         *,
-        upsample: int = 1,
+        upsample: Optional[int] = None,
         draw_block: bool = True,
         block_alpha: float = 0.55,
-        max_side: int = 1600,
+        max_side: Optional[int] = None,
     ) -> tuple[int, np.ndarray]:
-        """Count from an RGB uint8 array (H×W×3)."""
-        rgb = self._maybe_downscale_rgb(rgb, max_side=max_side)
-        locs = self._locations(rgb, upsample=upsample)
+        d_up, d_side = self._defaults_for_count()
+        up = d_up if upsample is None else upsample
+        side = d_side if max_side is None else max_side
+
+        rgb = self._maybe_downscale_rgb(rgb, side)
+        locs = self._locations(rgb, upsample=up)
         return self._annotate_bgr(rgb, locs, draw_block=draw_block, block_alpha=block_alpha)
 
     def count_faces_in_bytes(
         self,
         image_bytes: bytes,
         *,
-        upsample: int = 1,
+        upsample: Optional[int] = None,
         draw_block: bool = True,
         block_alpha: float = 0.55,
-        max_side: int = 1600,
+        max_side: Optional[int] = None,
     ) -> tuple[int, np.ndarray]:
-        """Decode JPEG/PNG bytes, then count (no temp file)."""
         arr = np.frombuffer(image_bytes, dtype=np.uint8)
         bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if bgr is None:
@@ -132,23 +188,13 @@ class FaceCounterSystem:
             max_side=max_side,
         )
 
-    @staticmethod
-    def _maybe_downscale_rgb(rgb: np.ndarray, max_side: int = 1600) -> np.ndarray:
-        """Shrink huge photos before detection (much faster, minimal count loss)."""
-        h, w = rgb.shape[:2]
-        m = max(h, w)
-        if m <= max_side:
-            return rgb
-        scale = max_side / m
-        nw, nh = int(w * scale), int(h * scale)
-        return cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_AREA)
-
     def count_faces_in_folder(
         self,
         folder_path: str,
         output_dir: str = "output",
-        upsample: int = 1,
+        upsample: Optional[int] = None,
         draw_block: bool = True,
+        max_side: Optional[int] = None,
     ) -> dict[str, int]:
         results: dict[str, int] = {}
         folder = Path(folder_path)
@@ -163,6 +209,7 @@ class FaceCounterSystem:
                 output_dir=output_dir,
                 upsample=upsample,
                 draw_block=draw_block,
+                max_side=max_side,
             )
         return results
 
@@ -170,9 +217,12 @@ class FaceCounterSystem:
         self,
         camera_index: int = 0,
         downscale: float = 0.5,
-        upsample: int = 1,
+        upsample: Optional[int] = None,
         window_name: str = "Face Counter",
     ) -> None:
+        d_up, _ = self._defaults_for_count()
+        up = d_up if upsample is None else upsample
+
         video_capture = cv2.VideoCapture(camera_index)
         if not video_capture.isOpened():
             raise RuntimeError(f"Could not open camera index {camera_index}")
@@ -191,11 +241,7 @@ class FaceCounterSystem:
                 else frame
             )
             rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-            face_locations = face_recognition.face_locations(
-                rgb_small,
-                number_of_times_to_upsample=upsample,
-                model=self.model,
-            )
+            face_locations = self._locations(rgb_small, upsample=up)
 
             for (top, right, bottom, left) in face_locations:
                 if downscale != 1.0:
@@ -244,7 +290,7 @@ def main() -> None:
         results = system.count_faces_in_folder(folder_path, output_dir="output")
         print(f"Total faces (sum): {sum(results.values())}")
     elif choice == "3":
-        system.count_from_webcam(camera_index=0, downscale=0.5, upsample=1)
+        system.count_from_webcam(camera_index=0)
     else:
         print("Bye.")
 
