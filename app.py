@@ -8,8 +8,13 @@ Env:
   FACE_REC_DATA_DIR       default ``data``
   FACE_MODEL_CACHE        default ``<data>/.lbph_cache``
   FACE_REC_THRESHOLD      LBPH distance threshold
-  FACE_DETECT_DOWNSCALE   Haar downscale (e.g. 0.4)
+  FACE_DETECT_DOWNSCALE   Haar downscale (e.g. 0.55)
   FACE_REC_FORCE_RETRAIN  1 = ignore cache and retrain
+  FACE_COUNT_MODEL        hog (default) or cnn
+  FACE_COUNT_SENSITIVE    1 = higher upsample / larger max-side
+  FACE_COUNT_ENHANCE      0 = disable CLAHE contrast enhancement (default on)
+  FACE_COUNT_SHARPEN      1 = enable unsharp-mask (for blurry images)
+  FACE_COUNT_MIN_FACE     minimum face size in px (default 20)
 """
 
 from __future__ import annotations
@@ -48,8 +53,16 @@ def get_counter() -> FaceCounterSystem:
     if _counter is None:
         model = os.environ.get("FACE_COUNT_MODEL", "hog")
         sens = os.environ.get("FACE_COUNT_SENSITIVE", "0").lower()
-        sensitive = sens not in ("0", "false", "no")
-        _counter = FaceCounterSystem(model=model, sensitive_counting=sensitive)
+        enhance = os.environ.get("FACE_COUNT_ENHANCE", "1").lower() not in ("0", "false", "no")
+        sharpen = os.environ.get("FACE_COUNT_SHARPEN", "0").lower() not in ("0", "false", "no")
+        min_face = int(os.environ.get("FACE_COUNT_MIN_FACE", "20"))
+        _counter = FaceCounterSystem(
+            model=model,
+            sensitive_counting=sens not in ("0", "false", "no"),
+            enhance=enhance,
+            sharpen=sharpen,
+            min_face_size=min_face,
+        )
     return _counter
 
 
@@ -75,12 +88,13 @@ def get_recognizer() -> SimpleFaceRecognizer:
     return _recognizer
 
 
-def bgr_to_png_data_url(bgr: np.ndarray) -> str:
-    ok, buf = cv2.imencode(".png", bgr)
+def bgr_to_jpeg_data_url(bgr: np.ndarray, quality: int = 88) -> str:
+    """Encode as JPEG (3-5× smaller than PNG for photos, faster to transfer)."""
+    ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
     if not ok:
         raise RuntimeError("Failed to encode image")
     b64 = base64.b64encode(buf.tobytes()).decode("ascii")
-    return f"data:image/png;base64,{b64}"
+    return f"data:image/jpeg;base64,{b64}"
 
 
 @app.route("/")
@@ -138,7 +152,7 @@ def api_count():
     try:
         counter = get_counter()
         count, bgr = counter.count_faces_in_bytes(raw)
-        return jsonify({"count": count, "image": bgr_to_png_data_url(bgr)})
+        return jsonify({"count": count, "image": bgr_to_jpeg_data_url(bgr)})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
@@ -173,10 +187,10 @@ def api_recognize():
         thumb_url = None
         big_url = None
         if detail.similar_thumb_bgr is not None:
-            thumb_url = bgr_to_png_data_url(detail.similar_thumb_bgr)
+            thumb_url = bgr_to_jpeg_data_url(detail.similar_thumb_bgr)
         ref = rec.reference_display_bgr(detail)
         if ref is not None:
-            big_url = bgr_to_png_data_url(ref)
+            big_url = bgr_to_jpeg_data_url(ref)
 
         return jsonify(
             {
@@ -236,7 +250,7 @@ def api_snapshot_identify():
                 "is_match": detail.is_match,
                 "verdict": detail.verdict,
                 "similar_training_file": detail.similar_source,
-                "reference_large": bgr_to_png_data_url(ref) if ref is not None else None,
+                "reference_large": bgr_to_jpeg_data_url(ref) if ref is not None else None,
             }
         )
     except RuntimeError as e:

@@ -9,6 +9,12 @@ import cv2
 import numpy as np
 
 
+def _clahe_gray(gray: np.ndarray) -> np.ndarray:
+    """Apply CLAHE to a grayscale image for better face detection in low-contrast scenes."""
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(gray)
+
+
 def fingerprint_known_faces(known_faces_dir: str) -> str:
     """Hash of all image paths + size + mtime under known_faces. Used to skip redundant retraining."""
     root = Path(known_faces_dir)
@@ -53,7 +59,7 @@ class SimpleFaceRecognizer:
     DEFAULT_MATCH_THRESHOLD: float = 72.0
     THUMB_SIZE: int = 96
     DISPLAY_MATCH_SIZE: int = 256
-    DEFAULT_DETECT_DOWNSCALE: float = 0.45
+    DEFAULT_DETECT_DOWNSCALE: float = 0.55  # raised from 0.45 — keeps more detail for small faces
 
     def __init__(
         self,
@@ -99,6 +105,7 @@ class SimpleFaceRecognizer:
 
     def _detect_faces_xywh(self, frame_bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        gray = _clahe_gray(gray)  # boost contrast for dim / distant faces
         sc = self.detect_downscale
         if sc < 1.0:
             small = cv2.resize(gray, (0, 0), fx=sc, fy=sc, interpolation=cv2.INTER_AREA)
@@ -107,8 +114,8 @@ class SimpleFaceRecognizer:
         min_px = max(24, int(48 * sc))
         rects = self.face_cascade.detectMultiScale(
             small,
-            scaleFactor=1.2,
-            minNeighbors=3,
+            scaleFactor=1.1,   # finer pyramid steps than 1.2 — catches more face sizes
+            minNeighbors=4,    # consistent with training; fewer false positives than 3
             minSize=(min_px, min_px),
         )
         if sc < 1.0:
@@ -157,8 +164,9 @@ class SimpleFaceRecognizer:
                     continue
 
                 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                gray = _clahe_gray(gray)
                 faces = self.face_cascade.detectMultiScale(
-                    gray, scaleFactor=1.2, minNeighbors=5, minSize=(80, 80)
+                    gray, scaleFactor=1.1, minNeighbors=4, minSize=(60, 60)
                 )
                 if len(faces) == 0:
                     continue

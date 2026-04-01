@@ -174,7 +174,8 @@
     $("countFile").addEventListener("change", async (e) => {
       const f = e.target.files[0];
       if (!f) return;
-      $("countResult").innerHTML = loadingHtml("Analyzing…");
+      e.target.value = "";  // reset so the same file can be re-uploaded
+      $("countResult").innerHTML = loadingHtml(`Analyzing ${f.name}…`);
       $("countPreview").innerHTML = "";
       try {
         const data = await postFile("/api/count", f);
@@ -192,7 +193,8 @@
     $("recFile").addEventListener("change", async (e) => {
       const f = e.target.files[0];
       if (!f) return;
-      $("recResult").innerHTML = loadingHtml("Matching…");
+      e.target.value = "";  // reset so the same file can be re-uploaded
+      $("recResult").innerHTML = loadingHtml(`Matching ${f.name}…`);
       $("recBig").innerHTML = "";
       $("recThumb").innerHTML = "";
       try {
