@@ -3,4 +3,5 @@ face-recognition
 numpy
 pillow
 flask
+gunicorn
 setuptools<82

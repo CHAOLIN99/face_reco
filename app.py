@@ -15,6 +15,8 @@ Env:
   FACE_COUNT_ENHANCE      0 = disable CLAHE contrast enhancement (default on)
   FACE_COUNT_SHARPEN      1 = enable unsharp-mask (for blurry images)
   FACE_COUNT_MIN_FACE     minimum face size in px (default 20)
+  PORT                    if set: bind 0.0.0.0 (cloud); if unset: 127.0.0.1 + port scan
+  FLASK_DEBUG             see README (defaults differ with/without PORT)
 """
 
 from __future__ import annotations
@@ -282,7 +284,23 @@ def _resolve_run_port() -> int:
             ) from e
 
 
-if __name__ == "__main__":
+def _bind_config() -> tuple[int, str, bool]:
+    """Local dev: loopback + optional port scan. Cloud: PORT env + all interfaces (Render, Fly, Railway, etc.)."""
+    if "PORT" in os.environ:
+        port = int(os.environ["PORT"])
+        host = "0.0.0.0"
+        debug = os.environ.get("FLASK_DEBUG", "0").lower() in ("1", "true", "yes")
+        return port, host, debug
     port = _resolve_run_port()
-    print(f"\n  Face Studio → http://127.0.0.1:{port}/\n")
-    app.run(host="127.0.0.1", port=port, debug=True)
+    host = "127.0.0.1"
+    debug = os.environ.get("FLASK_DEBUG", "1").lower() not in ("0", "false", "no")
+    return port, host, debug
+
+
+if __name__ == "__main__":
+    port, host, debug = _bind_config()
+    if host == "0.0.0.0":
+        print(f"\n  Face Studio → listening on 0.0.0.0:{port}/ (set FLASK_DEBUG=1 for debug)\n")
+    else:
+        print(f"\n  Face Studio → http://127.0.0.1:{port}/\n")
+    app.run(host=host, port=port, debug=debug)

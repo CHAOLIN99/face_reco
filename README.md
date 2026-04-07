@@ -2,7 +2,31 @@
 
 A small local toolkit for **counting faces** in images and **recognizing** who someone most likely is, using your own photo gallery. It includes a **Flask web UI** (Face Studio) and **command-line** scripts.
 
-Everything runs on your computer. Images you upload in the browser are sent only to your local Flask server (`127.0.0.1`), not to the cloud.
+When you run the app **locally**, images you upload are sent only to your Flask process on **loopback** (`127.0.0.1`), not to a third-party API. If you **deploy** the same app to a host on the internet, uploads go to **that server** — treat it like any other web backend (HTTPS, access control, and data policies are your responsibility).
+
+---
+
+## Deploying (GitHub and the web)
+
+**GitHub Pages** only serves static files; it **cannot** run this Python/Flask server. To publish the app from a GitHub repo, use one of these patterns:
+
+| Approach | What to do |
+|----------|------------|
+| **Container (recommended)** | The repo includes a **`Dockerfile`**. The workflow **`.github/workflows/docker-publish.yml`** builds on every push to `main`/`master` and pushes the image to **GitHub Container Registry** (`ghcr.io`). In GHCR, open the package → copy the image URL, then run it on Render, Fly.io, Railway, your own VM, etc. |
+| **Native Python** | Install dependencies on the host, set **`PORT`** (your platform usually sets this), and run **`gunicorn`** (see **`Procfile`**). You still need **`data/known_faces`** on the server. |
+
+**Production defaults:** If **`PORT`** is set (typical on cloud platforms), the app listens on **`0.0.0.0`** and **debug mode stays off** unless you set **`FLASK_DEBUG=1`**. Locally, without **`PORT`**, it keeps using **127.0.0.1** and **debug on** by default.
+
+**Docker image contents:** The image copies **`data/known_faces`** only (not the large **`unknown_faces`** test set) to keep the image smaller. Adjust the **`Dockerfile`** if you need extra data at runtime.
+
+**Pull the image from GHCR** (replace owner/repo):
+
+```bash
+docker pull ghcr.io/OWNER/face_rec:latest
+docker run --rm -p 8080:8080 -e PORT=8080 ghcr.io/OWNER/face_rec:latest
+```
+
+Then open `http://localhost:8080/`.
 
 ---
 
@@ -100,7 +124,8 @@ Open the URL printed in the terminal (defaults to **5050**; if that port is busy
 | `FACE_REC_FORCE_RETRAIN` | unset | Set to `1` / `true` to ignore cache on next load (also used internally by retrain API). |
 | `FACE_COUNT_MODEL` | `hog` | `hog` (CPU-friendly) or `cnn` (heavier; better quality if you have GPU support). |
 | `FACE_COUNT_SENSITIVE` | `0` | `1` / `true`: larger image + 2× upsample for small/distant faces (still dlib-only; fewer false positives than older Haar merge). |
-| `PORT` | (unset) | If unset, Flask tries 5050–5079, then an ephemeral port on loopback. Set explicitly (e.g. `export PORT=8000`) to force one port (fails if in use). |
+| `PORT` | (unset) | If **unset**, Flask tries 5050–5079 on **127.0.0.1**. If **set** (cloud deploys), the app listens on **0.0.0.0** with that port. |
+| `FLASK_DEBUG` | depends | With **`PORT` unset**: default **on**; set to `0`/`false`/`no` to disable. With **`PORT` set**: default **off**; set to `1`/`true`/`yes` to enable (not recommended in production). |
 
 Example:
 
