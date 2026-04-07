@@ -1,0 +1,12 @@
+.git
+.github
+.venv
+venv
+env
+__pycache__
+*.py[cod]
+.DS_Store
+output
+data/.lbph_cache
+# Large optional test set — not needed to serve the web app (known_faces is copied explicitly in Dockerfile)
+data/unknown_faces
