@@ -70,6 +70,32 @@
         <div id="countPreview" class="preview"></div>
       </section>
 
+      <section class="card card--people">
+        <div class="card__head">
+          <div class="card__icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/>
+              <circle cx="9" cy="7" r="4"/>
+              <path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"/>
+            </svg>
+          </div>
+          <div>
+            <h2>Count people</h2>
+            <p class="card__sub">HOG pedestrian detector — ideal for surveillance or overhead footage where faces aren't visible.</p>
+          </div>
+        </div>
+        <p class="hint">Works best on CCTV / angled-camera frames. Each person gets a numbered bounding box.</p>
+        <label class="drop">
+          <input type="file" id="peopleFile" accept="image/png,image/jpeg,image/webp" />
+          <span class="drop__inner">
+            <span class="drop__label">Choose or drop a surveillance frame</span>
+            <span class="drop__hint">PNG, JPEG, WebP</span>
+          </span>
+        </label>
+        <div id="peopleResult" class="result" aria-live="polite"></div>
+        <div id="peoplePreview" class="preview"></div>
+      </section>
+
       <section class="card card--rec">
         <div class="card__head">
           <div class="card__icon" aria-hidden="true">
@@ -243,7 +269,26 @@
         inputEl.dispatchEvent(new Event("change", { bubbles: true }));
       });
     }
-    document.querySelectorAll(".card--count .drop, .card--rec .drop").forEach((label) => {
+    $("peopleFile").addEventListener("change", async (e) => {
+      const f = e.target.files[0];
+      if (!f) return;
+      e.target.value = "";
+      $("peopleResult").innerHTML = loadingHtml(`Analyzing ${f.name}…`);
+      $("peoplePreview").innerHTML = "";
+      try {
+        const data = await postFile("/api/count_people", f);
+        $("peopleResult").innerHTML = `
+          <div class="stat-pill">
+            <span class="stat-pill__val">${data.count}</span>
+            <span class="stat-pill__lbl">people found</span>
+          </div>`;
+        $("peoplePreview").innerHTML = `<img src="${data.image}" alt="Annotated preview with person bounding boxes" />`;
+      } catch (err) {
+        $("peopleResult").innerHTML = `<div class="result--error">${err.message}</div>`;
+      }
+    });
+
+    document.querySelectorAll(".card--count .drop, .card--people .drop, .card--rec .drop").forEach((label) => {
       const input = label.querySelector('input[type="file"]');
       if (input) wireDropZone(label, input);
     });
