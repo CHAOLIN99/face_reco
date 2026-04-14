@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import csv
+import json
+import math
 import os
+import random
+import re
 import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import cv2
@@ -120,6 +125,141 @@ def _nms_xywh(
     return rects[idx], weights[idx]
 
 
+_IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".webp"})
+
+
+def _natural_sort_key(name: str) -> list:
+    """Split ``name`` into alternating text and integer tokens for sane ordering
+    (``img2`` before ``img10``; ``seq_000010`` still sorts with zero-padded names)."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
+
+
+def _natural_sort_paths(paths: list[Path]) -> list[Path]:
+    return sorted(paths, key=lambda p: _natural_sort_key(p.name))
+
+
+def list_image_files(folder: Path, *, recursive: bool = False) -> list[Path]:
+    """Return image paths under ``folder``, ordered with :func:`_natural_sort_paths`."""
+    if not folder.is_dir():
+        raise FileNotFoundError(f"Not a directory: {folder}")
+    if recursive:
+        raw = [
+            p for p in folder.rglob("*")
+            if p.is_file() and p.suffix.lower() in _IMAGE_EXTS
+        ]
+    else:
+        raw = [
+            p for p in folder.iterdir()
+            if p.is_file() and p.suffix.lower() in _IMAGE_EXTS
+        ]
+    return _natural_sort_paths(raw)
+
+
+def load_count_labels_csv(csv_path: str | Path) -> dict[str, int]:
+    """Load ``filename -> count`` from a CSV.
+
+    Accepts headers such as ``file`` / ``filename`` / ``frame`` for the key column
+    and ``count`` / ``truth`` / ``label`` for the integer; extra columns are ignored.
+    Opens with UTF-8-BOM support for Excel exports.
+    """
+    path = Path(csv_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Labels CSV not found: {path}")
+
+    with path.open(newline="", encoding="utf-8-sig") as fh:
+        sample = fh.read(4096)
+        fh.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+        except csv.Error:
+            dialect = csv.excel
+        reader = csv.reader(fh, dialect)
+        rows = list(reader)
+
+    if not rows:
+        return {}
+
+    header = [c.strip().lower() for c in rows[0]]
+    key_aliases = {"file", "filename", "frame", "name", "image"}
+    val_aliases = {"count", "truth", "label", "gt", "faces", "people"}
+
+    def find_col(aliases: set[str], cells: list[str]) -> int | None:
+        for i, h in enumerate(cells):
+            if h in aliases:
+                return i
+        return None
+
+    hk = find_col(key_aliases, header)
+    vk = find_col(val_aliases, header)
+
+    out: dict[str, int] = {}
+    if hk is not None and vk is not None:
+        for row in rows[1:]:
+            if len(row) <= max(hk, vk):
+                continue
+            key = row[hk].strip()
+            if not key:
+                continue
+            try:
+                out[key] = int(float(row[vk].strip()))
+            except ValueError:
+                continue
+    else:
+        for row in rows:
+            if len(row) < 2:
+                continue
+            key = row[0].strip()
+            if not key or key.lower() in key_aliases:
+                continue
+            try:
+                out[key] = int(float(row[1]))
+            except ValueError:
+                continue
+
+    if not out:
+        raise ValueError(
+            f"No valid label rows in {path} (expected header with file/count "
+            "or two columns: filename, integer count)."
+        )
+    return out
+
+
+def _mae_rmse_exact(
+    pairs: list[tuple[int, int]],
+) -> tuple[float, float, float, int]:
+    """``pairs`` are ``(predicted, truth)``. Returns MAE, RMSE, exact-match rate, n."""
+    if not pairs:
+        return 0.0, 0.0, 0.0, 0
+    n = len(pairs)
+    abs_err = sum(abs(a - b) for a, b in pairs)
+    mae = abs_err / n
+    rmse = math.sqrt(sum((a - b) ** 2 for a, b in pairs) / n)
+    exact = sum(1 for a, b in pairs if a == b) / n
+    return mae, rmse, exact, n
+
+
+@dataclass
+class CountEvalReport:
+    """Metrics from evaluating a counter against ground-truth CSV labels."""
+
+    train_mae: float
+    train_rmse: float
+    train_exact_rate: float
+    train_n: int
+    test_mae: float
+    test_rmse: float
+    test_exact_rate: float
+    test_n: int
+    labels_in_csv: int
+    matched_disk: int
+    missing_files: int
+    orphan_files: int
+    load_failures: int
+    train_ratio: float
+    seed: int
+    best_config: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Main class
 # ---------------------------------------------------------------------------
@@ -180,6 +320,36 @@ class FaceCounterSystem:
     @staticmethod
     def _load_rgb(path: str) -> np.ndarray:
         return face_recognition.load_image_file(path)
+
+    @staticmethod
+    def _load_rgb_safe(path: str) -> np.ndarray | None:
+        """Load RGB array or ``None`` on missing/corrupt/empty images (PIL errors)."""
+        try:
+            rgb = face_recognition.load_image_file(path)
+        except (OSError, ValueError):
+            return None
+        if rgb is None or rgb.size == 0:
+            return None
+        return rgb
+
+    def count_faces_only(
+        self,
+        image_path: str,
+        *,
+        upsample: int | None = None,
+        max_side: int | None = None,
+    ) -> int | None:
+        """Return face count, or ``None`` if the image could not be decoded."""
+        d_up, d_side = self._defaults_for_count()
+        up = d_up if upsample is None else upsample
+        side = d_side if max_side is None else max_side
+        rgb = self._load_rgb_safe(image_path)
+        if rgb is None:
+            return None
+        rgb = self._maybe_downscale_rgb(rgb, side)
+        rgb = self._preprocess(rgb)
+        locs = self._locations(rgb, upsample=up)
+        return len(locs)
 
     def _raw_locations(
         self,
@@ -394,9 +564,7 @@ class FaceCounterSystem:
             raise FileNotFoundError(f"Folder not found: {folder_path}")
 
         results: dict[str, int] = {}
-        for p in sorted(folder.iterdir()):
-            if p.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}:
-                continue
+        for p in list_image_files(folder):
             results[p.name] = self.count_faces_in_image(
                 str(p),
                 output_dir=output_dir,
@@ -669,6 +837,144 @@ class PersonCounterSystem:
         boxes = self._detect_hog(bgr)
         return self._annotate_bgr(bgr, boxes, "hog")
 
+    def count_people_hog_only(self, image_path: str) -> int | None:
+        """HOG person count, or ``None`` if the image could not be read."""
+        bgr = cv2.imread(image_path)
+        if bgr is None:
+            return None
+        return len(self._detect_hog(bgr))
+
+    def _person_boxes_for_sequence_frame(
+        self,
+        bgr: np.ndarray,
+        idx: int,
+        method: str,
+        mog2: cv2.BackgroundSubtractorMOG2,
+    ) -> tuple[list[tuple[int, int, int, int]], str]:
+        """Shared counting logic for sequential footage (HOG / MOG2 / combined)."""
+        fg_mask: np.ndarray | None = None
+        if method in ("mog2", "combined"):
+            fg_mask = mog2.apply(bgr)
+
+        in_warmup = (method in ("mog2", "combined")) and (idx < self._mog2_warmup)
+
+        if method == "hog" or in_warmup:
+            return self._detect_hog(bgr), "hog"
+        if method == "mog2":
+            return self._detect_blobs(fg_mask), "mog2"
+        return self._detect_combined(bgr, fg_mask), "combined"
+
+    def sequence_counts(
+        self,
+        folder_path: str,
+        method: str = "hog",
+        *,
+        progress_every: int = 100,
+    ) -> dict[str, int]:
+        """Run the same detection path as :meth:`process_frame_sequence` but only
+        return ``{filename -> count}`` (no files written). Skipped unreadable
+        frames are omitted from the mapping.
+        """
+        folder = Path(folder_path)
+        if not folder.exists():
+            raise FileNotFoundError(f"Folder not found: {folder_path}")
+
+        image_paths = list_image_files(folder)
+        if not image_paths:
+            raise RuntimeError(f"No images found in: {folder_path}")
+
+        mog2 = cv2.createBackgroundSubtractorMOG2(
+            history=200,
+            varThreshold=self._mog2_var_threshold,
+            detectShadows=False,
+        )
+
+        results: dict[str, int] = {}
+        total = len(image_paths)
+        seq_start = time.perf_counter()
+
+        print(f"\n[PersonCounter.sequence_counts] {total} frames  method={method}")
+        if method in ("mog2", "combined"):
+            print(f"  MOG2 warmup: first {self._mog2_warmup} frames (HOG during warmup)")
+
+        for idx, p in enumerate(image_paths):
+            bgr = cv2.imread(str(p))
+            if bgr is None:
+                print(f"  [skip] Cannot read {p.name}")
+                continue
+
+            boxes, _ = self._person_boxes_for_sequence_frame(bgr, idx, method, mog2)
+            results[p.name] = len(boxes)
+
+            if (idx + 1) % progress_every == 0 or idx == total - 1:
+                t = time.perf_counter() - seq_start
+                fps = (idx + 1) / t if t > 0 else 0.0
+                width = len(str(total))
+                print(f"  [{idx+1:>{width}}/{total}]  count={results[p.name]:>2}  fps={fps:.1f}")
+
+        print(f"  Done: {len(results)}/{total} frames with predictions.")
+        return results
+
+    def sequence_counts_subset(
+        self,
+        folder_path: str,
+        *,
+        method: str,
+        wanted_files: set[str],
+        progress_every: int = 200,
+    ) -> dict[str, int]:
+        """Like :meth:`sequence_counts`, but only returns counts for ``wanted_files``.
+
+        For sequential methods (mog2/combined), this still processes frames in order
+        (to keep the background model correct), but stops once it has processed up to
+        the last needed frame in filename order.
+        """
+        folder = Path(folder_path)
+        if not folder.exists():
+            raise FileNotFoundError(f"Folder not found: {folder_path}")
+
+        image_paths = list_image_files(folder)
+        if not image_paths:
+            raise RuntimeError(f"No images found in: {folder_path}")
+
+        # Determine how far we must process in the ordered list.
+        idx_by_name = {p.name: i for i, p in enumerate(image_paths)}
+        present = wanted_files & set(idx_by_name)
+        if not present:
+            return {}
+        last_idx = max(idx_by_name[n] for n in present)
+
+        mog2 = cv2.createBackgroundSubtractorMOG2(
+            history=200,
+            varThreshold=self._mog2_var_threshold,
+            detectShadows=False,
+        )
+
+        results: dict[str, int] = {}
+        total = last_idx + 1
+        seq_start = time.perf_counter()
+
+        print(f"\n[PersonCounter.sequence_counts_subset] up_to={total}  method={method}  wanted={len(present)}")
+        if method in ("mog2", "combined"):
+            print(f"  MOG2 warmup: first {self._mog2_warmup} frames (HOG during warmup)")
+
+        for idx, p in enumerate(image_paths[: total]):
+            bgr = cv2.imread(str(p))
+            if bgr is None:
+                continue
+
+            boxes, _ = self._person_boxes_for_sequence_frame(bgr, idx, method, mog2)
+            if p.name in wanted_files:
+                results[p.name] = len(boxes)
+
+            if (idx + 1) % progress_every == 0 or idx == total - 1:
+                t = time.perf_counter() - seq_start
+                fps = (idx + 1) / t if t > 0 else 0.0
+                width = len(str(total))
+                print(f"  [{idx+1:>{width}}/{total}]  collected={len(results):>3}  fps={fps:.1f}")
+
+        return results
+
     # ------------------------------------------------------------------
     # Public API — sequential frame processing
     # ------------------------------------------------------------------
@@ -710,10 +1016,7 @@ class PersonCounterSystem:
         if not folder.exists():
             raise FileNotFoundError(f"Folder not found: {folder_path}")
 
-        image_paths = sorted(
-            p for p in folder.iterdir()
-            if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
-        )
+        image_paths = list_image_files(folder)
         if not image_paths:
             raise RuntimeError(f"No images found in: {folder_path}")
 
@@ -746,22 +1049,9 @@ class PersonCounterSystem:
                 print(f"  [skip] Cannot read {p.name}")
                 continue
 
-            # Feed frame to MOG2 regardless of warmup — keeps model current
-            fg_mask: np.ndarray | None = None
-            if method in ("mog2", "combined"):
-                fg_mask = mog2.apply(bgr)
-
-            in_warmup = (method in ("mog2", "combined")) and (idx < self._mog2_warmup)
-
-            if method == "hog" or in_warmup:
-                boxes      = self._detect_hog(bgr)
-                used_method = "hog"
-            elif method == "mog2":
-                boxes      = self._detect_blobs(fg_mask)   # type: ignore[arg-type]
-                used_method = "mog2"
-            else:                                           # combined (post-warmup)
-                boxes      = self._detect_combined(bgr, fg_mask)  # type: ignore[arg-type]
-                used_method = "combined"
+            boxes, used_method = self._person_boxes_for_sequence_frame(
+                bgr, idx, method, mog2
+            )
 
             elapsed_ms = int((time.perf_counter() - t0) * 1000)
             count, annotated = self._annotate_bgr(bgr, boxes, used_method)
@@ -872,6 +1162,267 @@ class PersonCounterSystem:
 
 
 # ---------------------------------------------------------------------------
+# Train / test evaluation vs ground-truth CSV labels
+# ---------------------------------------------------------------------------
+
+def evaluate_face_counter_against_csv(
+    *,
+    images_dir: str | Path,
+    labels_csv: str | Path,
+    train_ratio: float = 0.8,
+    seed: int = 42,
+    model: str = "hog",
+    enhance: bool = True,
+    sharpen: bool = False,
+    nms_iou: float = 0.35,
+    tune_hparams: bool = False,
+    limit: int | None = None,
+    chronological_split: bool = False,
+    sensitive_counting: bool | None = None,
+    min_face_size: int | None = None,
+) -> CountEvalReport:
+    """Evaluate :class:`FaceCounterSystem` on still images with a ``file,count`` CSV.
+
+    Splits labeled images that exist on disk into train/test sets (random by
+    default; use ``chronological_split`` for a stable filename-order split).
+    Optional ``tune_hparams`` picks the lowest train MAE among a small grid of
+    ``sensitive_counting`` / ``min_face_size`` presets, then scores test data.
+    """
+    folder = Path(images_dir)
+    labels = load_count_labels_csv(labels_csv)
+    labeled_names = set(labels)
+    rng = random.Random(seed)
+
+    disk_images = {
+        p.name for p in folder.iterdir()
+        if p.is_file() and p.suffix.lower() in _IMAGE_EXTS
+    }
+    missing_files = len(labeled_names - disk_images)
+    orphan_files = len(disk_images - labeled_names)
+
+    paths = _natural_sort_paths(
+        [folder / n for n in labeled_names if n in disk_images]
+    )
+    if not paths:
+        raise ValueError(
+            f"No CSV labels matched image files under {folder}. "
+            f"(missing on disk: {missing_files}, orphans: {orphan_files})"
+        )
+
+    if limit is not None:
+        if chronological_split:
+            paths = paths[: min(limit, len(paths))]
+        else:
+            p2 = paths.copy()
+            rng.shuffle(p2)
+            paths = sorted(p2[: min(limit, len(paths))], key=lambda x: _natural_sort_key(x.name))
+
+    configs: list[tuple[str, dict[str, object]]] = [
+        ("default_min20", {"sensitive_counting": False, "min_face_size": 20}),
+        ("sensitive_min20", {"sensitive_counting": True, "min_face_size": 20}),
+        ("sensitive_min15", {"sensitive_counting": True, "min_face_size": 15}),
+        ("sensitive_min25", {"sensitive_counting": True, "min_face_size": 25}),
+        ("default_min15", {"sensitive_counting": False, "min_face_size": 15}),
+    ]
+
+    if not tune_hparams and (
+        sensitive_counting is not None or min_face_size is not None
+    ):
+        sens = False if sensitive_counting is None else sensitive_counting
+        mf = 20 if min_face_size is None else int(min_face_size)
+        configs = [("env_matched", {"sensitive_counting": sens, "min_face_size": mf})]
+
+
+    base_kw: dict[str, object] = {
+        "model": model,
+        "enhance": enhance,
+        "sharpen": sharpen,
+        "nms_iou": nms_iou,
+    }
+
+    def predict_items(
+        counter: FaceCounterSystem,
+        subset: list[tuple[Path, int]],
+    ) -> tuple[list[tuple[int, int]], int]:
+        pairs: list[tuple[int, int]] = []
+        fails = 0
+        for p, truth in subset:
+            pred = counter.count_faces_only(str(p))
+            if pred is None:
+                fails += 1
+                continue
+            pairs.append((pred, truth))
+        return pairs, fails
+
+    items: list[tuple[Path, int]] = [(p, labels[p.name]) for p in paths]
+    work = items.copy()
+    if not chronological_split:
+        rng.shuffle(work)
+
+    n = len(work)
+    if n == 0:
+        raise ValueError("No items to evaluate after filtering.")
+
+    if n == 1:
+        train_items, test_items = work, []
+    else:
+        k = int(n * train_ratio)
+        k = max(1, min(k, n - 1))
+        train_items, test_items = work[:k], work[k:]
+
+    def _mae(pairs: list[tuple[int, int]]) -> float:
+        if not pairs:
+            return float("inf")
+        return sum(abs(a - b) for a, b in pairs) / len(pairs)
+
+    chosen_name, chosen_ov = configs[0]
+
+    if tune_hparams:
+        best_mae = float("inf")
+        for name, ov in configs:
+            c = FaceCounterSystem(**base_kw, **ov)  # type: ignore[arg-type]
+            tr_pairs, _ = predict_items(c, train_items)
+            m = _mae(tr_pairs)
+            if m < best_mae:
+                best_mae = m
+                chosen_name, chosen_ov = name, ov
+
+    final = FaceCounterSystem(**base_kw, **chosen_ov)  # type: ignore[arg-type]
+    train_pairs, lf_tr = predict_items(final, train_items)
+    test_pairs, lf_te = predict_items(final, test_items)
+
+    tm, trmse, tex, tn = _mae_rmse_exact(train_pairs)
+    vm, vrmse, vex, vn = _mae_rmse_exact(test_pairs)
+
+    return CountEvalReport(
+        train_mae=tm,
+        train_rmse=trmse,
+        train_exact_rate=tex,
+        train_n=tn,
+        test_mae=vm,
+        test_rmse=vrmse,
+        test_exact_rate=vex,
+        test_n=vn,
+        labels_in_csv=len(labels),
+        matched_disk=len(paths),
+        missing_files=missing_files,
+        orphan_files=orphan_files,
+        load_failures=lf_tr + lf_te,
+        train_ratio=train_ratio,
+        seed=seed,
+        best_config=f"{chosen_name} ({chosen_ov})" if tune_hparams else f"{chosen_name}",
+    )
+
+
+def evaluate_person_counter_against_csv(
+    *,
+    frames_dir: str | Path,
+    labels_csv: str | Path,
+    train_ratio: float = 0.8,
+    seed: int = 42,
+    method: str = "hog",
+    limit: int | None = None,
+    chronological_split: bool = True,
+    progress_every: int = 200,
+) -> CountEvalReport:
+    """Score pedestrian counts vs a ground-truth ``file,count`` CSV."""
+    labels = load_count_labels_csv(labels_csv)
+    folder = Path(frames_dir)
+    if not folder.is_dir():
+        raise FileNotFoundError(f"Not a directory: {folder}")
+
+    disk = {p.name for p in list_image_files(folder)}
+    labeled_names = set(labels)
+    missing_files = len(labeled_names - disk)
+    orphan_files = len(disk - labeled_names)
+    common = sorted(labeled_names & disk, key=_natural_sort_key)
+    if limit is not None:
+        if chronological_split:
+            common = common[: min(limit, len(common))]
+        else:
+            rng = random.Random(seed)
+            tmp = common.copy()
+            rng.shuffle(tmp)
+            common = tmp[: min(limit, len(tmp))]
+    if not common:
+        raise ValueError(
+            "No overlap between CSV labels and image files "
+            f"in {folder}. (missing_files={missing_files}, orphans={orphan_files})"
+        )
+
+    pcs = PersonCounterSystem()
+
+    ordered_pairs: list[tuple[int, int]] = []
+    load_failures = 0
+
+    if method == "hog":
+        # Frames are independent → only read/process the requested subset.
+        for name in common:
+            pred = pcs.count_people_hog_only(str(folder / name))
+            if pred is None:
+                load_failures += 1
+                continue
+            ordered_pairs.append((pred, labels[name]))
+    else:
+        # Sequential methods need ordered processing up to the last needed frame.
+        wanted = set(common)
+        all_counts = pcs.sequence_counts_subset(
+            str(folder),
+            method=method,
+            wanted_files=wanted,
+            progress_every=progress_every,
+        )
+        for name in common:
+            if name not in all_counts:
+                load_failures += 1
+                continue
+            ordered_pairs.append((all_counts[name], labels[name]))
+
+    if not ordered_pairs:
+        raise RuntimeError(
+            "No prediction/label pairs produced. "
+            "Check that all labeled frames exist and are readable."
+        )
+
+    if chronological_split:
+        order = ordered_pairs.copy()
+    else:
+        rng = random.Random(seed)
+        order = ordered_pairs.copy()
+        rng.shuffle(order)
+
+    pn = len(order)
+    if pn == 1:
+        train_pairs, test_pairs = order, []
+    else:
+        pk = int(pn * train_ratio)
+        pk = max(1, min(pk, pn - 1))
+        train_pairs, test_pairs = order[:pk], order[pk:]
+
+    tm, trmse, tex, tn = _mae_rmse_exact(train_pairs)
+    vm, vrmse, vex, vn = _mae_rmse_exact(test_pairs)
+
+    return CountEvalReport(
+        train_mae=tm,
+        train_rmse=trmse,
+        train_exact_rate=tex,
+        train_n=tn,
+        test_mae=vm,
+        test_rmse=vrmse,
+        test_exact_rate=vex,
+        test_n=vn,
+        labels_in_csv=len(labels),
+        matched_disk=len(common),
+        missing_files=missing_files,
+        orphan_files=orphan_files,
+        load_failures=load_failures,
+        train_ratio=train_ratio,
+        seed=seed,
+        best_config=f"method={method}",
+    )
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -912,7 +1463,95 @@ def main() -> None:
                         help="[person, sequence] Skip saving annotated frames.")
     parser.add_argument("--no-csv", action="store_true",
                         help="[person, sequence] Skip writing counts.csv.")
+    parser.add_argument(
+        "--eval-face", action="store_true",
+        help="Train/test metrics vs a CSV of true face counts (see --images-dir, --labels-csv).",
+    )
+    parser.add_argument(
+        "--eval-person", action="store_true",
+        help="Train/test metrics vs a CSV of true pedestrian counts for a frame folder.",
+    )
+    parser.add_argument(
+        "--images-dir", default="image_data",
+        help="[eval-face] Still image directory (default: image_data).",
+    )
+    parser.add_argument(
+        "--frames-dir", default="frames",
+        help="[eval-person] Frame directory (default: frames).",
+    )
+    parser.add_argument(
+        "--labels-csv", default=None,
+        help="Ground-truth CSV with columns file,count. If omitted for --eval-face, "
+             "uses output_image_data_test/image_data_counts.csv when that file exists.",
+    )
+    parser.add_argument("--train-ratio", type=float, default=0.8,
+                        help="Fraction of labeled items used for training metrics (default: 0.8).")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for shuffled train/test split.")
+    parser.add_argument(
+        "--tune-hparams", action="store_true",
+        help="[eval-face] Pick sensitive/min_face preset with lowest train MAE.",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None,
+        help="Maximum number of labeled files to use (smoke tests).",
+    )
+    parser.add_argument(
+        "--split", choices=("random", "chronological"), default="random",
+        help="Train/test assignment: random shuffle vs file-name order.",
+    )
+    parser.add_argument(
+        "--eval-report", default=None,
+        help="Write evaluation metrics JSON to this file.",
+    )
     args, _ = parser.parse_known_args()
+
+    if args.eval_face:
+        csv_path = args.labels_csv
+        if csv_path is None:
+            fallback = Path("output_image_data_test/image_data_counts.csv")
+            csv_path = str(fallback) if fallback.is_file() else None
+        if not csv_path:
+            raise SystemExit(
+                "Provide --labels-csv FILE (or place "
+                "output_image_data_test/image_data_counts.csv)."
+            )
+        report = evaluate_face_counter_against_csv(
+            images_dir=args.images_dir,
+            labels_csv=csv_path,
+            train_ratio=args.train_ratio,
+            seed=args.seed,
+            model=args.model,
+            enhance=not args.no_enhance,
+            sharpen=args.sharpen,
+            tune_hparams=args.tune_hparams,
+            limit=args.limit,
+            chronological_split=(args.split == "chronological"),
+            sensitive_counting=bool(args.sensitive),
+        )
+        out = json.dumps(asdict(report), indent=2)
+        print(out)
+        if args.eval_report:
+            Path(args.eval_report).write_text(out + "\n", encoding="utf-8")
+        return
+
+    if args.eval_person:
+        if not args.labels_csv:
+            raise SystemExit("--labels-csv is required for --eval-person (true pedestrian counts).")
+        report = evaluate_person_counter_against_csv(
+            frames_dir=args.frames_dir,
+            labels_csv=args.labels_csv,
+            train_ratio=args.train_ratio,
+            seed=args.seed,
+            method=args.method,
+            limit=args.limit,
+            chronological_split=(args.split == "chronological"),
+        )
+        out = json.dumps(asdict(report), indent=2)
+        print(out)
+        if args.eval_report:
+            Path(args.eval_report).write_text(out + "\n", encoding="utf-8")
+        return
 
     if args.detector == "person":
         system = PersonCounterSystem()
