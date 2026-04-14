@@ -8,8 +8,8 @@ Web UI: face counting + recognition with cached LBPH model,
 Env:
   FACE_REC_DATA_DIR       default ``data``
   FACE_MODEL_CACHE        default ``<data>/.lbph_cache``
-  FACE_REC_THRESHOLD      LBPH distance threshold (default 72)
-  FACE_DETECT_DOWNSCALE   Haar downscale factor (default 0.55)
+  FACE_REC_THRESHOLD      embedding L2 distance threshold (default 0.55; lower = stricter)
+  FACE_DETECT_DOWNSCALE   kept for API compat; not used internally
   FACE_REC_FORCE_RETRAIN  1 = ignore cache and retrain
   FACE_COUNT_MODEL        hog (default) or cnn
   FACE_COUNT_SENSITIVE    1 = higher upsample / larger max-side

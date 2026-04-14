@@ -141,6 +141,10 @@ class SimpleFaceRecognizer:
         self._enc_list: list[np.ndarray] = []   # each shape (128,)
         self._lbl_list: list[int] = []
 
+        # Cached (N, 128) matrix built lazily from _enc_list.
+        # Set to None whenever _enc_list changes so it is rebuilt on next access.
+        self._enc_matrix: np.ndarray | None = None
+
         # Representative thumbnail per label (first detected face per person)
         self._rep_thumb_by_label: dict[int, tuple[np.ndarray, str]] = {}
         self._cache_loaded: bool = False
@@ -148,6 +152,16 @@ class SimpleFaceRecognizer:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _get_enc_matrix(self) -> np.ndarray:
+        """Return the cached (N, 128) training-encoding matrix, building it if stale."""
+        if self._enc_matrix is None:
+            self._enc_matrix = (
+                np.stack(self._enc_list, axis=0)
+                if self._enc_list
+                else np.empty((0, 128), dtype=np.float64)
+            )
+        return self._enc_matrix
 
     @staticmethod
     def _bgr_to_rgb(bgr: np.ndarray) -> np.ndarray:
@@ -205,6 +219,7 @@ class SimpleFaceRecognizer:
         self.label_to_name.clear()
         self._enc_list.clear()
         self._lbl_list.clear()
+        self._enc_matrix = None          # invalidate cached matrix
         self._rep_thumb_by_label.clear()
 
         for person_dir in sorted(p for p in dataset_path.iterdir() if p.is_dir()):
@@ -317,7 +332,9 @@ class SimpleFaceRecognizer:
         self.match_threshold = float(meta.get("match_threshold", self.DEFAULT_MATCH_THRESHOLD))
         self.detect_downscale = float(meta.get("detect_downscale", self.DEFAULT_DETECT_DOWNSCALE))
 
-        self._enc_list = [enc_array[i] for i in range(len(enc_array))]
+        # Keep the loaded array as the cached matrix; split into row views for _enc_list.
+        self._enc_matrix = enc_array                  # (N, 128) — already contiguous
+        self._enc_list = list(enc_array)              # row views, each shape (128,)
         self._lbl_list = list(lbl_array.astype(int))
 
         self._rep_thumb_by_label.clear()
@@ -375,8 +392,8 @@ class SimpleFaceRecognizer:
         if not self.trained or not self._enc_list:
             raise RuntimeError("Model is not trained. Call train_or_load() first.")
 
-        known = np.stack(self._enc_list, axis=0)           # (N, 128)
-        distances = self._fr.face_distance(known, encoding) # (N,)
+        known     = self._get_enc_matrix()               # (N, 128) — cached
+        distances = self._fr.face_distance(known, encoding)  # (N,)
         best_idx  = int(np.argmin(distances))
         best_dist = float(distances[best_idx])
         label_id  = self._lbl_list[best_idx]
@@ -394,6 +411,38 @@ class SimpleFaceRecognizer:
             similar_thumb_bgr=thumb,
             similar_source=src,
         )
+
+    def _match_all_encodings(
+        self, encodings: np.ndarray  # (M, 128)
+    ) -> list[FaceMatchDetail]:
+        """Vectorized matching for M face encodings in a single matrix pass.
+
+        Computes all M×N pairwise L2 distances at once instead of calling
+        face_distance M times, then builds one FaceMatchDetail per row.
+        """
+        known = self._get_enc_matrix()          # (N, 128)
+        # Broadcasting: (M, 1, 128) - (1, N, 128) → norms → (M, N)
+        diff      = encodings[:, np.newaxis, :] - known[np.newaxis, :, :]
+        distances = np.linalg.norm(diff, axis=2)          # (M, N)
+        best_cols = distances.argmin(axis=1)              # (M,)
+        best_dists = distances[np.arange(len(encodings)), best_cols]  # (M,)
+
+        results: list[FaceMatchDetail] = []
+        for bi, bd in zip(best_cols.tolist(), best_dists.tolist()):
+            label_id = self._lbl_list[bi]
+            name     = self.label_to_name.get(label_id, "unknown")
+            is_match = bd <= self.match_threshold
+            rep      = self._rep_thumb_by_label.get(label_id)
+            thumb, src = (rep[0], rep[1]) if rep else (None, None)
+            results.append(FaceMatchDetail(
+                name=name,
+                distance=bd,
+                is_match=is_match,
+                verdict=self._verdict_most_likely(name, bd, is_match),
+                similar_thumb_bgr=thumb,
+                similar_source=src,
+            ))
+        return results
 
     def _verdict_most_likely(self, name: str, distance: float, is_match: bool) -> str:
         base = f"Most likely: {name} (distance {distance:.3f})"
@@ -420,13 +469,10 @@ class SimpleFaceRecognizer:
         if len(pairs) == 1:
             return self._match_encoding(pairs[0][1])
 
-        # Multiple faces: return the one with the lowest distance to any known person
-        best: FaceMatchDetail | None = None
-        for _, enc in pairs:
-            detail = self._match_encoding(enc)
-            if best is None or detail.distance < best.distance:
-                best = detail
-        return best
+        # Multiple faces: one vectorized pass over all detected encodings.
+        encodings = np.stack([enc for _, enc in pairs], axis=0)  # (M, 128)
+        details   = self._match_all_encodings(encodings)
+        return min(details, key=lambda d: d.distance)
 
     def identify_largest_face(
         self, frame_bgr: np.ndarray
