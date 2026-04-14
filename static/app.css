@@ -318,6 +318,18 @@ code {
   border-color: rgba(129, 140, 248, 0.2);
 }
 
+.card--people .card__icon {
+  color: #34d399;
+  background: rgba(52, 211, 153, 0.1);
+  border-color: rgba(52, 211, 153, 0.2);
+}
+
+.card--people .drop:hover,
+.card--people .drop--active {
+  border-color: rgba(52, 211, 153, 0.4);
+  background: rgba(52, 211, 153, 0.05);
+}
+
 .card--cam .card__icon {
   color: #f472b6;
   background: rgba(244, 114, 182, 0.1);
