@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import csv
 import json
-import math
 import os
 import random
 import re
 import time
+from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -230,12 +230,12 @@ def _mae_rmse_exact(
     """``pairs`` are ``(predicted, truth)``. Returns MAE, RMSE, exact-match rate, n."""
     if not pairs:
         return 0.0, 0.0, 0.0, 0
-    n = len(pairs)
-    abs_err = sum(abs(a - b) for a, b in pairs)
-    mae = abs_err / n
-    rmse = math.sqrt(sum((a - b) ** 2 for a, b in pairs) / n)
-    exact = sum(1 for a, b in pairs if a == b) / n
-    return mae, rmse, exact, n
+    arr  = np.array(pairs, dtype=np.float64)  # (N, 2)
+    diff = arr[:, 0] - arr[:, 1]
+    mae   = float(np.mean(np.abs(diff)))
+    rmse  = float(np.sqrt(np.mean(diff ** 2)))
+    exact = float(np.mean(diff == 0))
+    return mae, rmse, exact, len(pairs)
 
 
 @dataclass
@@ -598,7 +598,7 @@ class FaceCounterSystem:
         print("\nWebcam: q or Esc to quit.")
 
         DETECT_SCALE = 0.75
-        recent_counts: list[int] = []
+        recent_counts: deque[int] = deque(maxlen=smooth_frames)
 
         while True:
             ret, frame = cap.read()
@@ -619,8 +619,6 @@ class FaceCounterSystem:
 
             # Rolling average for a stable display count
             recent_counts.append(len(face_locations))
-            if len(recent_counts) > smooth_frames:
-                recent_counts.pop(0)
             display_count = round(sum(recent_counts) / len(recent_counts))
 
             for (top, right, bottom, left) in face_locations:
@@ -1090,11 +1088,12 @@ class PersonCounterSystem:
         if save_frames:
             print(f"  Frames → {frames_dir}/")
 
-        # Summary statistics
+        # Summary statistics (vectorized)
         counts = list(results.values())
         if counts:
-            min_c = min(counts);  max_c = max(counts)
-            mean_c = sum(counts) / len(counts)
+            arr    = np.array(counts, dtype=np.int32)
+            min_c  = int(arr.min());  max_c = int(arr.max())
+            mean_c = float(arr.mean())
             min_f  = next(f for f, c in results.items() if c == min_c)
             max_f  = next(f for f, c in results.items() if c == max_c)
             total_elapsed = time.perf_counter() - seq_start
@@ -1127,7 +1126,7 @@ class PersonCounterSystem:
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         print("\nWebcam (person/HOG): q or Esc to quit.")
 
-        recent_counts: list[int] = []
+        recent_counts: deque[int] = deque(maxlen=smooth_frames)
 
         while True:
             ret, frame = cap.read()
@@ -1137,8 +1136,6 @@ class PersonCounterSystem:
             boxes = self._detect_hog(frame)
 
             recent_counts.append(len(boxes))
-            if len(recent_counts) > smooth_frames:
-                recent_counts.pop(0)
             display_count = round(sum(recent_counts) / len(recent_counts))
 
             for (x, y, w, h) in boxes:
