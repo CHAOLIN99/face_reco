@@ -16,6 +16,13 @@ Env:
   FACE_COUNT_ENHANCE      0 = disable CLAHE contrast enhancement (default on)
   FACE_COUNT_SHARPEN      1 = enable unsharp-mask sharpening (for blurry images)
   FACE_COUNT_MIN_FACE     minimum face size in px (default 20)
+  FACE_COUNT_NMS_IOU      NMS IoU for face duplicate merge (default 0.35)
+  FACE_EVAL_IMAGES_DIR    default still-image folder for /api/eval_face (image_data)
+  FACE_EVAL_FRAMES_DIR    default frames folder for /api/eval_person (frames)
+  FACE_EVAL_FACE_LABELS   default CSV path for face eval labels (output_image_data_test/image_data_counts.csv)
+  FACE_EVAL_API           set to 1/true to enable POST /api/eval_face and /api/eval_person
+  FACE_EVAL_DEFAULT_LIMIT sample size default for eval API (default 200)
+  FACE_EVAL_MAX           hard cap on eval limit per request (default 2000)
   PORT                    if set: bind 0.0.0.0 (cloud); if unset: 127.0.0.1 + port scan
   FLASK_DEBUG             see README (defaults differ with/without PORT)
 """
@@ -25,13 +32,19 @@ from __future__ import annotations
 import base64
 import os
 import socket
+from dataclasses import asdict
 from pathlib import Path
 
 import cv2
 import numpy as np
 from flask import Flask, jsonify, render_template, request
 
-from face_count import FaceCounterSystem, PersonCounterSystem
+from face_count import (
+    FaceCounterSystem,
+    PersonCounterSystem,
+    evaluate_face_counter_against_csv,
+    evaluate_person_counter_against_csv,
+)
 from face_rec import SimpleFaceRecognizer, default_cache_dir, resolve_unknown_dir
 
 app = Flask(__name__)
@@ -43,6 +56,41 @@ MODEL_CACHE = os.environ.get(
     "FACE_MODEL_CACHE",
     str(default_cache_dir(DATA_DIR)),
 )
+
+# Project root: server-side eval paths must stay under this directory.
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def _eval_api_enabled() -> bool:
+    return os.environ.get("FACE_EVAL_API", "").lower() in ("1", "true", "yes")
+
+
+def _safe_path_under_project(path_str: str) -> Path:
+    """Resolve ``path_str`` to an absolute path confined under ``PROJECT_ROOT``."""
+    p = Path(path_str)
+    if not p.is_absolute():
+        p = (PROJECT_ROOT / p).resolve()
+    else:
+        p = p.resolve()
+    try:
+        p.relative_to(PROJECT_ROOT)
+    except ValueError as e:
+        raise ValueError(f"Path must be under project root: {path_str}") from e
+    return p
+
+
+def _eval_face_defaults() -> tuple[str, str | None]:
+    """``(images_dir, labels_csv)`` with optional labels path if that file exists."""
+    img = os.environ.get("FACE_EVAL_IMAGES_DIR", "image_data")
+    lbl = os.environ.get("FACE_EVAL_FACE_LABELS", "")
+    if lbl:
+        return img, lbl
+    fallback = PROJECT_ROOT / "output_image_data_test" / "image_data_counts.csv"
+    return img, str(fallback) if fallback.is_file() else None
+
+
+def _eval_person_defaults() -> str:
+    return os.environ.get("FACE_EVAL_FRAMES_DIR", "frames")
 
 _counter: FaceCounterSystem | None = None
 _person_counter: PersonCounterSystem | None = None
@@ -59,12 +107,14 @@ def get_counter() -> FaceCounterSystem:
         enhance  = os.environ.get("FACE_COUNT_ENHANCE", "1").lower() not in ("0", "false", "no")
         sharpen  = os.environ.get("FACE_COUNT_SHARPEN", "0").lower() not in ("0", "false", "no")
         min_face = int(os.environ.get("FACE_COUNT_MIN_FACE", "20"))
+        nms_iou = float(os.environ.get("FACE_COUNT_NMS_IOU", "0.35"))
         _counter = FaceCounterSystem(
             model=model,
             sensitive_counting=sens not in ("0", "false", "no"),
             enhance=enhance,
             sharpen=sharpen,
             min_face_size=min_face,
+            nms_iou=nms_iou,
         )
     return _counter
 
@@ -127,6 +177,12 @@ def index():
 def health():
     rec_ok   = Path(KNOWN_FACES).exists()
     cache_ok = Path(MODEL_CACHE).is_dir() and (Path(MODEL_CACHE) / "meta.json").is_file()
+    eval_img_rel = os.environ.get("FACE_EVAL_IMAGES_DIR", "image_data")
+    eval_fr_rel = os.environ.get("FACE_EVAL_FRAMES_DIR", "frames")
+    eval_img = PROJECT_ROOT / eval_img_rel
+    eval_fr = PROJECT_ROOT / eval_fr_rel
+    _, face_lbl_default = _eval_face_defaults()
+    face_lbl_path = Path(face_lbl_default) if face_lbl_default else None
     return jsonify(
         {
             "data_dir":            DATA_DIR,
@@ -136,6 +192,17 @@ def health():
             "cache_present":       cache_ok,
             "unknown_dir":         resolve_unknown_dir(DATA_DIR) if rec_ok else None,
             "last_load_mode":      _last_train_mode,
+            "eval": {
+                "api_enabled":           _eval_api_enabled(),
+                "face_images_dir":       str(eval_img),
+                "face_images_exists":    eval_img.is_dir(),
+                "frames_dir":            str(eval_fr),
+                "frames_exists":         eval_fr.is_dir(),
+                "face_labels_csv":       str(face_lbl_path) if face_lbl_path else None,
+                "face_labels_exists":    face_lbl_path.is_file() if face_lbl_path else False,
+                "default_eval_limit":    int(os.environ.get("FACE_EVAL_DEFAULT_LIMIT", "200")),
+                "max_eval_limit":        int(os.environ.get("FACE_EVAL_MAX", "2000")),
+            },
         }
     )
 
@@ -207,6 +274,166 @@ def api_count_people():
         return jsonify({"error": str(e)}), 400
     except RuntimeError as e:
         return jsonify({"error": str(e)}), 500
+
+
+def _eval_json_body() -> dict:
+    if not request.is_json:
+        return {}
+    raw = request.get_json(silent=True)
+    return raw if isinstance(raw, dict) else {}
+
+
+@app.route("/api/eval_face", methods=["POST"])
+def api_eval_face():
+    """Train/test metrics for still images vs a CSV (opt-in via ``FACE_EVAL_API``)."""
+    if not _eval_api_enabled():
+        return jsonify(
+            {"error": "Server-side eval is disabled. Set FACE_EVAL_API=1 to enable POST /api/eval_face."}
+        ), 403
+
+    data = _eval_json_body()
+    if not data and request.form:
+        data = {k: request.form.get(k) for k in request.form}
+
+    img_arg = data.get("images_dir")
+    lbl_arg = data.get("labels_csv")
+    default_img, default_lbl = _eval_face_defaults()
+    img_rel = img_arg if img_arg is not None else default_img
+    lbl_rel = lbl_arg if lbl_arg is not None else default_lbl
+    if not lbl_rel:
+        return jsonify(
+            {
+                "error": "No labels CSV. Pass labels_csv or set FACE_EVAL_FACE_LABELS, "
+                         "or add output_image_data_test/image_data_counts.csv under the project.",
+            }
+        ), 400
+
+    try:
+        img_path = _safe_path_under_project(str(img_rel))
+        lbl_path = _safe_path_under_project(str(lbl_rel))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    default_limit = int(os.environ.get("FACE_EVAL_DEFAULT_LIMIT", "200"))
+    hard_max = int(os.environ.get("FACE_EVAL_MAX", "2000"))
+    try:
+        lim_raw = data.get("limit", default_limit)
+        limit = int(lim_raw) if lim_raw not in (None, "") else default_limit
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid limit"}), 400
+    limit = max(1, min(limit, hard_max))
+
+    try:
+        train_ratio = float(data.get("train_ratio", 0.8))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid train_ratio"}), 400
+
+    try:
+        seed = int(data.get("seed", 42))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid seed"}), 400
+
+    split = str(data.get("split", "random"))
+    if split not in ("random", "chronological"):
+        return jsonify({"error": "split must be \"random\" or \"chronological\""}), 400
+
+    tune = str(data.get("tune_hparams", "false")).lower() in ("1", "true", "yes")
+
+    c = get_counter()
+    try:
+        report = evaluate_face_counter_against_csv(
+            images_dir=str(img_path),
+            labels_csv=str(lbl_path),
+            train_ratio=train_ratio,
+            seed=seed,
+            model=c.model,
+            enhance=c.enhance,
+            sharpen=c.sharpen,
+            nms_iou=c.nms_iou,
+            tune_hparams=tune,
+            limit=limit,
+            chronological_split=(split == "chronological"),
+            sensitive_counting=c.sensitive_counting,
+            min_face_size=c.min_face_size,
+        )
+    except (OSError, ValueError, RuntimeError) as e:
+        return jsonify({"error": str(e)}), 400
+
+    return jsonify(asdict(report))
+
+
+@app.route("/api/eval_person", methods=["POST"])
+def api_eval_person():
+    """Train/test metrics for a frame folder vs a pedestrian ground-truth CSV."""
+    if not _eval_api_enabled():
+        return jsonify(
+            {"error": "Server-side eval is disabled. Set FACE_EVAL_API=1 to enable POST /api/eval_person."}
+        ), 403
+
+    data = _eval_json_body()
+    if not data and request.form:
+        data = {k: request.form.get(k) for k in request.form}
+
+    fr_rel = data.get("frames_dir") if data.get("frames_dir") is not None else _eval_person_defaults()
+    lbl_rel = data.get("labels_csv")
+    if not lbl_rel:
+        return jsonify(
+            {"error": "labels_csv is required (true pedestrian counts per frame filename)."}
+        ), 400
+
+    try:
+        fr_path = _safe_path_under_project(str(fr_rel))
+        lbl_path = _safe_path_under_project(str(lbl_rel))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    default_limit = int(os.environ.get("FACE_EVAL_DEFAULT_LIMIT", "200"))
+    hard_max = int(os.environ.get("FACE_EVAL_MAX", "2000"))
+    try:
+        lim_raw = data.get("limit", default_limit)
+        limit = int(lim_raw) if lim_raw not in (None, "") else default_limit
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid limit"}), 400
+    limit = max(1, min(limit, hard_max))
+
+    try:
+        train_ratio = float(data.get("train_ratio", 0.8))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid train_ratio"}), 400
+
+    try:
+        seed = int(data.get("seed", 42))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid seed"}), 400
+
+    split = str(data.get("split", "chronological"))
+    if split not in ("random", "chronological"):
+        return jsonify({"error": "split must be \"random\" or \"chronological\""}), 400
+
+    method = str(data.get("method", "hog"))
+    if method not in ("hog", "mog2", "combined"):
+        return jsonify({"error": "method must be hog, mog2, or combined"}), 400
+
+    try:
+        pe = int(data.get("progress_every", 200))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid progress_every"}), 400
+
+    try:
+        report = evaluate_person_counter_against_csv(
+            frames_dir=str(fr_path),
+            labels_csv=str(lbl_path),
+            train_ratio=train_ratio,
+            seed=seed,
+            method=method,
+            limit=limit,
+            chronological_split=(split == "chronological"),
+            progress_every=max(1, pe),
+        )
+    except (OSError, ValueError, RuntimeError) as e:
+        return jsonify({"error": str(e)}), 400
+
+    return jsonify(asdict(report))
 
 
 @app.route("/api/recognize", methods=["POST"])
