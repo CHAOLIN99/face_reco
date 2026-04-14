@@ -15,15 +15,9 @@ import numpy as np
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _clahe_gray(gray: np.ndarray) -> np.ndarray:
-    """Apply CLAHE to a grayscale image — improves detection and recognition
-    in low-contrast, dark, or hazy scenes."""
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    return clahe.apply(gray)
-
-
-# Bump this when changing crop/detection/training pipeline.
-RECOGNIZER_PIPELINE_VERSION = "2026-04-14-margin0.12-alt2-fallback"
+# Bump this when changing crop/detection/training pipeline so the cache is
+# invalidated automatically.
+RECOGNIZER_PIPELINE_VERSION = "2026-04-14-deepembedding-v1"
 
 
 def fingerprint_known_faces(known_faces_dir: str) -> str:
@@ -44,7 +38,6 @@ def fingerprint_known_faces(known_faces_dir: str) -> str:
             continue
         rel = p.relative_to(root).as_posix()
         lines.append(f"{rel}\t{st.st_size}\t{st.st_mtime_ns}")
-    # Include pipeline version so cache is invalidated on preprocessing changes.
     lines.append(f"__pipeline__\t{RECOGNIZER_PIPELINE_VERSION}")
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
@@ -74,7 +67,6 @@ def expected_label_from_filename(filename: str) -> str:
     - otherwise uses the stem as-is.
     """
     stem = Path(filename).stem.strip()
-    # Hyphen must be escaped inside a character class to avoid forming a range.
     stem = re.sub(r"[_\-\s]\d+$", "", stem).strip()
     return stem
 
@@ -85,10 +77,10 @@ def expected_label_from_filename(filename: str) -> str:
 
 @dataclass
 class FaceMatchDetail:
-    """LBPH prediction result for a single face crop."""
+    """Deep-embedding prediction result for a single face."""
 
     name: str
-    distance: float
+    distance: float       # L2 embedding distance; lower = more similar (0–1+ range)
     is_match: bool
     verdict: str
     similar_thumb_bgr: np.ndarray | None
@@ -101,61 +93,55 @@ class FaceMatchDetail:
 
 class SimpleFaceRecognizer:
     """
-    OpenCV Haar + LBPH face recognizer.
+    Face recognizer using 128-d dlib deep embeddings via the face_recognition library.
 
     Training images must be organized as:
         data/known_faces/<Person Name>/*.jpg|jpeg|png|webp
 
     A model cache (default ``data/.lbph_cache``) is written after training
     so subsequent runs skip retraining when the data hasn't changed.
+
+    Distance is the L2 Euclidean distance between 128-d face embeddings.
+    A distance ≤ DEFAULT_MATCH_THRESHOLD (0.55) is considered a confident match.
     """
 
-    DEFAULT_MATCH_THRESHOLD: float = 72.0
+    DEFAULT_MATCH_THRESHOLD: float = 0.55   # 0.6 is the face_recognition default; 0.55 is tighter
     THUMB_SIZE: int = 96
     DISPLAY_MATCH_SIZE: int = 256
-    # 0.55 gives a good balance between speed and small-face detection.
-    DEFAULT_DETECT_DOWNSCALE: float = 0.55
-    # Must match between training and inference crops; LBPH is sensitive to framing.
-    DEFAULT_CROP_MARGIN_FRAC: float = 0.12
+    DEFAULT_DETECT_DOWNSCALE: float = 0.55  # kept for API compat; not used internally
+    DEFAULT_CROP_MARGIN_FRAC: float = 0.12  # kept for API compat; not used internally
 
     def __init__(
         self,
-        cascade_path: str | None = None,
+        cascade_path: str | None = None,    # kept for API compat; not used
         match_threshold: float | None = None,
         detect_downscale: float | None = None,
     ) -> None:
-        if not hasattr(cv2, "face"):
+        try:
+            import face_recognition as _fr
+            self._fr = _fr
+        except ImportError as e:
             raise RuntimeError(
-                "cv2.face module not found. "
-                "Install 'opencv-contrib-python' instead of 'opencv-python'."
-            )
+                "face_recognition not installed. Run: pip install face-recognition"
+            ) from e
 
-        self.recognizer = cv2.face.LBPHFaceRecognizer_create()
         self.match_threshold = (
-            float(match_threshold)
-            if match_threshold is not None
+            float(match_threshold) if match_threshold is not None
             else self.DEFAULT_MATCH_THRESHOLD
         )
         self.detect_downscale = (
-            float(detect_downscale)
-            if detect_downscale is not None
+            float(detect_downscale) if detect_downscale is not None
             else self.DEFAULT_DETECT_DOWNSCALE
         )
 
-        # Primary cascade can be overridden; we also keep a secondary cascade for tough images.
-        if cascade_path is None:
-            cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        if not os.path.exists(cascade_path):
-            raise FileNotFoundError(f"Haar cascade not found: {cascade_path}")
-        self.face_cascade = cv2.CascadeClassifier(cascade_path)
-
-        alt2_path = cv2.data.haarcascades + "haarcascade_frontalface_alt2.xml"
-        self.face_cascade_alt2 = (
-            cv2.CascadeClassifier(alt2_path) if os.path.exists(alt2_path) else None
-        )
         self.label_to_name: dict[int, str] = {}
         self.trained: bool = False
-        self._training_samples: list[tuple[int, np.ndarray, np.ndarray, str]] = []
+
+        # Flat parallel lists — index i corresponds to the same training sample.
+        self._enc_list: list[np.ndarray] = []   # each shape (128,)
+        self._lbl_list: list[int] = []
+
+        # Representative thumbnail per label (first detected face per person)
         self._rep_thumb_by_label: dict[int, tuple[np.ndarray, str]] = {}
         self._cache_loaded: bool = False
 
@@ -163,123 +149,52 @@ class SimpleFaceRecognizer:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _make_thumb_bgr(
-        self, img_bgr: np.ndarray, x: int, y: int, w: int, h: int
+    @staticmethod
+    def _bgr_to_rgb(bgr: np.ndarray) -> np.ndarray:
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    def _make_thumb_from_location(
+        self, img_bgr: np.ndarray, location: tuple[int, int, int, int]
     ) -> np.ndarray:
-        crop = img_bgr[y : y + h, x : x + w]
+        """Crop face bbox to a THUMB_SIZE × THUMB_SIZE BGR thumbnail."""
+        top, right, bottom, left = location
+        h_img, w_img = img_bgr.shape[:2]
+        top    = max(0, top)
+        left   = max(0, left)
+        bottom = min(h_img, bottom)
+        right  = min(w_img, right)
+        crop = img_bgr[top:bottom, left:right]
         if crop.size == 0:
             return np.zeros((self.THUMB_SIZE, self.THUMB_SIZE, 3), dtype=np.uint8)
         return cv2.resize(crop, (self.THUMB_SIZE, self.THUMB_SIZE))
 
-    def _detect_faces_xywh(
-        self, frame_bgr: np.ndarray
-    ) -> list[tuple[int, int, int, int]]:
-        """Detect faces and return (x, y, w, h) boxes in original image coordinates."""
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        gray = _clahe_gray(gray)
-
-        def run(
-            cascade: cv2.CascadeClassifier,
-            sc: float,
-            *,
-            min_neighbors: int,
-            min_px: int,
-        ) -> list[tuple[int, int, int, int]]:
-            if sc < 1.0:
-                small = cv2.resize(gray, (0, 0), fx=sc, fy=sc, interpolation=cv2.INTER_AREA)
-            else:
-                small = gray
-            rects = cascade.detectMultiScale(
-                small,
-                scaleFactor=1.1,     # finer pyramid — catches more face sizes than 1.2
-                minNeighbors=min_neighbors,
-                minSize=(min_px, min_px),
-            )
-            if sc < 1.0:
-                inv = 1.0 / sc
-                return [
-                    (
-                        int(round(x * inv)),
-                        int(round(y * inv)),
-                        int(round(w * inv)),
-                        int(round(h * inv)),
-                    )
-                    for (x, y, w, h) in rects
-                ]
-            return [(int(x), int(y), int(w), int(h)) for (x, y, w, h) in rects]
-
-        # Fast path
-        sc = float(self.detect_downscale)
-        min_px = max(24, int(48 * sc))
-        rects = run(self.face_cascade, sc, min_neighbors=4, min_px=min_px)
-        if rects:
-            return rects
-
-        # Fallback: full-res and looser thresholds; then try alt2 cascade if available.
-        rects = run(self.face_cascade, 1.0, min_neighbors=3, min_px=24)
-        if rects:
-            return rects
-        if self.face_cascade_alt2 is not None:
-            rects = run(self.face_cascade_alt2, 1.0, min_neighbors=3, min_px=24)
-            if rects:
-                return rects
-            rects = run(self.face_cascade_alt2, sc, min_neighbors=4, min_px=min_px)
-            if rects:
-                return rects
-        return []
-
     @staticmethod
-    def _clip_rect_xywh(
-        x: int, y: int, w: int, h: int, *, width: int, height: int
-    ) -> tuple[int, int, int, int]:
-        x = max(0, min(x, width - 1))
-        y = max(0, min(y, height - 1))
-        w = max(1, min(w, width - x))
-        h = max(1, min(h, height - y))
-        return x, y, w, h
+    def _face_area(loc: tuple[int, int, int, int]) -> int:
+        """Return pixel area of a (top, right, bottom, left) face location."""
+        top, right, bottom, left = loc
+        return max(0, (bottom - top) * (right - left))
 
-    def _face_gray_200_from_rect(
-        self,
-        frame_bgr: np.ndarray,
-        rect: tuple[int, int, int, int],
-        *,
-        margin_frac: float | None = None,
-    ) -> np.ndarray | None:
-        """Crop a face ROI with a bit of context and normalize to 200×200 gray."""
-        if margin_frac is None:
-            margin_frac = self.DEFAULT_CROP_MARGIN_FRAC
-        h_img, w_img = frame_bgr.shape[:2]
-        x, y, w, h = rect
-        mx = int(round(w * margin_frac))
-        my = int(round(h * margin_frac))
-        x, y, w, h = self._clip_rect_xywh(
-            x - mx, y - my, w + 2 * mx, h + 2 * my, width=w_img, height=h_img
-        )
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        gray = _clahe_gray(gray)  # must match training pipeline
-        roi = gray[y : y + h, x : x + w]
-        if roi.size == 0:
-            return None
-        return cv2.resize(roi, (200, 200))
+    def _detect_all(
+        self, img_bgr: np.ndarray
+    ) -> list[tuple[tuple[int, int, int, int], np.ndarray]]:
+        """Detect all faces in a BGR image.
+        Returns a list of (location, 128-d encoding) pairs sorted largest-face-first."""
+        rgb = self._bgr_to_rgb(img_bgr)
+        locations = self._fr.face_locations(rgb, model="hog")
+        if not locations:
+            return []
+        encodings = self._fr.face_encodings(rgb, known_face_locations=locations)
+        pairs = list(zip(locations, encodings))
+        pairs.sort(key=lambda p: self._face_area(p[0]), reverse=True)
+        return pairs
 
     # ------------------------------------------------------------------
     # Training
     # ------------------------------------------------------------------
 
-    def _collect_images_from_folder(
-        self,
-        labeled_faces_root_dir: str,
-    ) -> tuple[list[np.ndarray], list[int]]:
-        """
-        Walk ``known_faces/<Person>/`` subdirectories, detect one face per image,
-        and build LBPH training arrays.
-
-        Label IDs are assigned only to persons that have at least one detectable
-        face, so IDs are always contiguous and match the cache exactly.
-        """
-        images: list[np.ndarray] = []
-        labels: list[int] = []
-
+    def _collect_images_from_folder(self, labeled_faces_root_dir: str) -> None:
+        """Walk known_faces/<Person>/ subdirectories, compute face embeddings,
+        and populate internal state."""
         dataset_path = Path(labeled_faces_root_dir)
         if not dataset_path.exists():
             raise FileNotFoundError(
@@ -288,7 +203,8 @@ class SimpleFaceRecognizer:
 
         label_id = 0
         self.label_to_name.clear()
-        self._training_samples.clear()
+        self._enc_list.clear()
+        self._lbl_list.clear()
         self._rep_thumb_by_label.clear()
 
         for person_dir in sorted(p for p in dataset_path.iterdir() if p.is_dir()):
@@ -304,29 +220,23 @@ class SimpleFaceRecognizer:
                     print(f"  [skip] Cannot read {img_path.name}")
                     continue
 
-                faces = self._detect_faces_xywh(img)
-                if not faces:
+                pairs = self._detect_all(img)
+                if not pairs:
                     print(f"  [skip] No face detected in {img_path.name}")
                     continue
 
                 if not found_any:
-                    # Only assign a label ID once we know this person has data
                     self.label_to_name[label_id] = person_name
                     found_any = True
 
-                x, y, w, h = max(faces, key=lambda r: r[2] * r[3])
-                face_resized = self._face_gray_200_from_rect(img, (x, y, w, h))
-                if face_resized is None:
-                    print(f"  [skip] Empty crop in {img_path.name}")
-                    continue
-                thumb = self._make_thumb_bgr(img, x, y, w, h)
+                # Use the largest detected face
+                loc, enc = pairs[0]
 
-                images.append(face_resized)
-                labels.append(label_id)
-                self._training_samples.append(
-                    (label_id, face_resized, thumb, img_path.name)
-                )
+                self._enc_list.append(enc)
+                self._lbl_list.append(label_id)
+
                 if label_id not in self._rep_thumb_by_label:
+                    thumb = self._make_thumb_from_location(img, loc)
                     self._rep_thumb_by_label[label_id] = (thumb, img_path.name)
 
             if found_any:
@@ -334,17 +244,14 @@ class SimpleFaceRecognizer:
             else:
                 print(f"  [warn] No usable images for '{person_name}' — skipped.")
 
-        if not images:
+        if not self._enc_list:
             raise RuntimeError(
                 "No training faces found. "
                 "Check that known_faces/<Name>/ contains images with detectable frontal faces."
             )
 
-        return images, labels
-
     def train_from_known_faces(self, known_faces_dir: str) -> None:
-        images, labels = self._collect_images_from_folder(known_faces_dir)
-        self.recognizer.train(images, np.array(labels))
+        self._collect_images_from_folder(known_faces_dir)
         self.trained = True
         self._cache_loaded = False
 
@@ -353,11 +260,18 @@ class SimpleFaceRecognizer:
     # ------------------------------------------------------------------
 
     def save_cache(self, cache_dir: str | Path, fingerprint: str) -> None:
-        """Write LBPH model XML, meta.json, and per-label reference thumbnails."""
+        """Write embeddings (.npz), meta.json, and per-label reference thumbnails."""
         d = Path(cache_dir)
         d.mkdir(parents=True, exist_ok=True)
 
-        self.recognizer.write(str(d / "lbph_model.xml"))
+        if self._enc_list:
+            enc_array = np.stack(self._enc_list, axis=0)          # (N, 128)
+            lbl_array = np.array(self._lbl_list, dtype=np.int32)  # (N,)
+        else:
+            enc_array = np.empty((0, 128), dtype=np.float64)
+            lbl_array = np.empty((0,), dtype=np.int32)
+
+        np.savez_compressed(str(d / "embeddings.npz"), encodings=enc_array, labels=lbl_array)
 
         thumb_sources: dict[str, str] = {}
         for lid, (thumb, src) in self._rep_thumb_by_label.items():
@@ -367,7 +281,6 @@ class SimpleFaceRecognizer:
         meta = {
             "fingerprint": fingerprint,
             "pipeline_version": RECOGNIZER_PIPELINE_VERSION,
-            "crop_margin_frac": self.DEFAULT_CROP_MARGIN_FRAC,
             "label_to_name": {str(k): v for k, v in sorted(self.label_to_name.items())},
             "thumb_source": thumb_sources,
             "match_threshold": self.match_threshold,
@@ -376,11 +289,11 @@ class SimpleFaceRecognizer:
         (d / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     def load_cache(self, cache_dir: str | Path, expected_fingerprint: str) -> bool:
-        """Load cached model if the fingerprint matches.  Returns True on success."""
+        """Load cached embeddings if the fingerprint matches. Returns True on success."""
         d = Path(cache_dir)
         meta_path = d / "meta.json"
-        model_path = d / "lbph_model.xml"
-        if not meta_path.is_file() or not model_path.is_file():
+        emb_path  = d / "embeddings.npz"
+        if not meta_path.is_file() or not emb_path.is_file():
             return False
 
         try:
@@ -392,25 +305,21 @@ class SimpleFaceRecognizer:
             return False
         if meta.get("pipeline_version") != RECOGNIZER_PIPELINE_VERSION:
             return False
-        if float(meta.get("crop_margin_frac", -1.0)) != float(self.DEFAULT_CROP_MARGIN_FRAC):
-            return False
 
-        self.recognizer = cv2.face.LBPHFaceRecognizer_create()
         try:
-            self.recognizer.read(str(model_path))
-        except cv2.error:
-            # Corrupt/incompatible cache file: ignore and force retraining.
+            data = np.load(str(emb_path))
+            enc_array = data["encodings"]
+            lbl_array = data["labels"]
+        except Exception:
             return False
 
         self.label_to_name = {int(k): v for k, v in meta["label_to_name"].items()}
-        self.match_threshold = float(
-            meta.get("match_threshold", self.DEFAULT_MATCH_THRESHOLD)
-        )
-        self.detect_downscale = float(
-            meta.get("detect_downscale", self.DEFAULT_DETECT_DOWNSCALE)
-        )
+        self.match_threshold = float(meta.get("match_threshold", self.DEFAULT_MATCH_THRESHOLD))
+        self.detect_downscale = float(meta.get("detect_downscale", self.DEFAULT_DETECT_DOWNSCALE))
 
-        self._training_samples.clear()
+        self._enc_list = [enc_array[i] for i in range(len(enc_array))]
+        self._lbl_list = list(lbl_array.astype(int))
+
         self._rep_thumb_by_label.clear()
         thumb_src_map: dict[str, str] = meta.get("thumb_source") or {}
         for lid in self.label_to_name:
@@ -458,122 +367,76 @@ class SimpleFaceRecognizer:
         return "trained"
 
     # ------------------------------------------------------------------
-    # Prediction helpers
+    # Core matching
     # ------------------------------------------------------------------
 
-    def _best_similar_training_thumb(
-        self, face_gray_200: np.ndarray, predicted_label: int
-    ) -> tuple[np.ndarray | None, str | None]:
-        """Return the training thumbnail whose pixel values are closest (MSE)
-        to the query face.  Falls back to the representative thumbnail when
-        training samples are not in memory (cache-loaded mode)."""
-        if not self._training_samples:
-            rep = self._rep_thumb_by_label.get(predicted_label)
-            return (rep[0], rep[1]) if rep else (None, None)
+    def _match_encoding(self, encoding: np.ndarray) -> FaceMatchDetail:
+        """Find the closest known face to the given 128-d embedding."""
+        if not self.trained or not self._enc_list:
+            raise RuntimeError("Model is not trained. Call train_or_load() first.")
 
-        candidates = [
-            (g, t, src)
-            for lid, g, t, src in self._training_samples
-            if lid == predicted_label
-        ]
-        if not candidates:
-            rep = self._rep_thumb_by_label.get(predicted_label)
-            return (rep[0], rep[1]) if rep else (None, None)
+        known = np.stack(self._enc_list, axis=0)           # (N, 128)
+        distances = self._fr.face_distance(known, encoding) # (N,)
+        best_idx  = int(np.argmin(distances))
+        best_dist = float(distances[best_idx])
+        label_id  = self._lbl_list[best_idx]
+        name      = self.label_to_name.get(label_id, "unknown")
+        is_match  = best_dist <= self.match_threshold
 
-        best_mse = float("inf")
-        best_thumb: np.ndarray | None = None
-        best_src: str | None = None
-        q = face_gray_200.astype(np.float32)
-        for gray, thumb, src in candidates:
-            mse = float(np.mean((gray.astype(np.float32) - q) ** 2))
-            if mse < best_mse:
-                best_mse = mse
-                best_thumb = thumb
-                best_src = src
-        return best_thumb, best_src
+        rep = self._rep_thumb_by_label.get(label_id)
+        thumb, src = (rep[0], rep[1]) if rep else (None, None)
+
+        return FaceMatchDetail(
+            name=name,
+            distance=best_dist,
+            is_match=is_match,
+            verdict=self._verdict_most_likely(name, best_dist, is_match),
+            similar_thumb_bgr=thumb,
+            similar_source=src,
+        )
 
     def _verdict_most_likely(self, name: str, distance: float, is_match: bool) -> str:
-        base = f"Most likely: {name} (distance {distance:.1f})"
+        base = f"Most likely: {name} (distance {distance:.3f})"
         if is_match:
             return f"{base} — above confidence threshold"
         return f"{base} — best guess only (raise threshold if too loose)"
 
     # ------------------------------------------------------------------
-    # Core match API
+    # High-level predict API  (same signatures as before)
     # ------------------------------------------------------------------
 
-    def match_face_gray(
-        self,
-        face_gray_200: np.ndarray,
-        *,
-        fast_thumbnail: bool = False,
-    ) -> FaceMatchDetail:
-        """Run LBPH prediction on a 200×200 grayscale face crop."""
+    def predict_from_bgr_detail(
+        self, frame_bgr: np.ndarray
+    ) -> FaceMatchDetail | None:
+        """Run recognition on a decoded BGR frame.
+        Returns the best-matching identity, or None if no face is detected."""
         if not self.trained:
-            raise RuntimeError("Model is not trained. Call train_or_load() first.")
+            raise RuntimeError("Model is not trained.")
 
-        label_id, distance = self.recognizer.predict(face_gray_200)
-        name = self.label_to_name.get(label_id, "unknown")
-        is_match = float(distance) <= self.match_threshold
-
-        if fast_thumbnail or self._cache_loaded:
-            rep = self._rep_thumb_by_label.get(label_id)
-            thumb, src = (rep[0], rep[1]) if rep else (None, None)
-        else:
-            thumb, src = self._best_similar_training_thumb(face_gray_200, label_id)
-
-        return FaceMatchDetail(
-            name=name,
-            distance=float(distance),
-            is_match=is_match,
-            verdict=self._verdict_most_likely(name, float(distance), is_match),
-            similar_thumb_bgr=thumb,
-            similar_source=src,
-        )
-
-    def largest_face_gray_200(self, frame_bgr: np.ndarray) -> np.ndarray | None:
-        """Detect the largest face in a BGR frame; return a 200×200 CLAHE grayscale
-        crop ready for LBPH prediction.
-
-        CLAHE is applied here to match the training pipeline in
-        ``_collect_images_from_folder``, which also extracts ROIs from the
-        CLAHE-enhanced gray image.
-        """
-        faces = self._detect_faces_xywh(frame_bgr)
-        if not faces:
+        pairs = self._detect_all(frame_bgr)
+        if not pairs:
             return None
-        x, y, w, h = max(faces, key=lambda r: r[2] * r[3])
-        return self._face_gray_200_from_rect(frame_bgr, (x, y, w, h))
 
-    def best_face_gray_200(self, frame_bgr: np.ndarray) -> np.ndarray | None:
-        """Detect faces and return the crop with the lowest LBPH distance."""
-        faces = self._detect_faces_xywh(frame_bgr)
-        if not faces:
-            return None
-        best: np.ndarray | None = None
-        best_dist = float("inf")
-        for rect in sorted(faces, key=lambda r: r[2] * r[3], reverse=True):
-            crop = self._face_gray_200_from_rect(frame_bgr, rect)
-            if crop is None:
-                continue
-            try:
-                _lid, dist = self.recognizer.predict(crop)
-            except cv2.error:
-                continue
-            d = float(dist)
-            if d < best_dist:
-                best_dist = d
-                best = crop
+        if len(pairs) == 1:
+            return self._match_encoding(pairs[0][1])
+
+        # Multiple faces: return the one with the lowest distance to any known person
+        best: FaceMatchDetail | None = None
+        for _, enc in pairs:
+            detail = self._match_encoding(enc)
+            if best is None or detail.distance < best.distance:
+                best = detail
         return best
 
     def identify_largest_face(
         self, frame_bgr: np.ndarray
     ) -> FaceMatchDetail | None:
-        """Single-shot: largest face → LBPH → most likely person (fast path)."""
-        crop = self.largest_face_gray_200(frame_bgr)
-        if crop is None:
+        """Single-shot: largest face → embedding → identity (fast path for webcam)."""
+        pairs = self._detect_all(frame_bgr)
+        if not pairs:
             return None
-        return self.match_face_gray(crop, fast_thumbnail=True)
+        # _detect_all already sorts largest-first
+        return self._match_encoding(pairs[0][1])
 
     def reference_display_bgr(self, detail: FaceMatchDetail) -> np.ndarray | None:
         """Return a 256×256 reference thumbnail for the UI."""
@@ -586,22 +449,8 @@ class SimpleFaceRecognizer:
         )
 
     # ------------------------------------------------------------------
-    # Predict from image / BGR frame
+    # Image / folder helpers
     # ------------------------------------------------------------------
-
-    def predict_from_bgr_detail(
-        self, frame_bgr: np.ndarray
-    ) -> FaceMatchDetail | None:
-        """Run recognition on a decoded BGR frame.
-        Avoids temp-file I/O when the caller already holds the image in memory."""
-        if not self.trained:
-            raise RuntimeError("Model is not trained.")
-        crop = self.best_face_gray_200(frame_bgr)
-        if crop is None:
-            crop = self.largest_face_gray_200(frame_bgr)
-        if crop is None:
-            return None
-        return self.match_face_gray(crop, fast_thumbnail=bool(self._cache_loaded))
 
     def predict_from_image_detail(
         self, image_path: str
@@ -623,10 +472,6 @@ class SimpleFaceRecognizer:
             return None, None
         return detail.name, detail.distance
 
-    # ------------------------------------------------------------------
-    # Batch / webcam
-    # ------------------------------------------------------------------
-
     def predict_from_unknown_folder(
         self, unknown_face_dir: str
     ) -> dict[str, tuple[str | None, float | None]]:
@@ -635,11 +480,9 @@ class SimpleFaceRecognizer:
             raise FileNotFoundError(
                 f"Unknown-faces folder does not exist: {unknown_face_dir}"
             )
-
         image_paths = _iter_images(unknown_path)
         if not image_paths:
             raise RuntimeError(f"No images found in: {unknown_face_dir}")
-
         return {p.name: self.predict_from_image(str(p)) for p in image_paths}
 
     def evaluate_unknown_folder_by_filename(
@@ -719,6 +562,50 @@ class SimpleFaceRecognizer:
             "mismatches": mismatches,
         }
 
+    # ------------------------------------------------------------------
+    # Legacy / compat methods (kept so external callers don't break)
+    # ------------------------------------------------------------------
+
+    def match_face_gray(
+        self, face_gray_200: np.ndarray, *, fast_thumbnail: bool = False
+    ) -> FaceMatchDetail:
+        """Legacy LBPH-era method. Converts the gray crop back to BGR and re-encodes."""
+        bgr = cv2.cvtColor(face_gray_200, cv2.COLOR_GRAY2BGR)
+        result = self.predict_from_bgr_detail(bgr)
+        if result is not None:
+            return result
+        return FaceMatchDetail(
+            name="unknown",
+            distance=999.0,
+            is_match=False,
+            verdict="No face found in gray→BGR conversion",
+            similar_thumb_bgr=None,
+            similar_source=None,
+        )
+
+    def largest_face_gray_200(self, frame_bgr: np.ndarray) -> np.ndarray | None:
+        """Legacy: detect the largest face and return a 200×200 gray crop."""
+        pairs = self._detect_all(frame_bgr)
+        if not pairs:
+            return None
+        top, right, bottom, left = pairs[0][0]
+        h, w = frame_bgr.shape[:2]
+        top = max(0, top); left = max(0, left)
+        bottom = min(h, bottom); right = min(w, right)
+        crop = frame_bgr[top:bottom, left:right]
+        if crop.size == 0:
+            return None
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        return cv2.resize(gray, (200, 200))
+
+    def best_face_gray_200(self, frame_bgr: np.ndarray) -> np.ndarray | None:
+        """Legacy: returns the largest face gray crop (best-match logic is now in encoding space)."""
+        return self.largest_face_gray_200(frame_bgr)
+
+    # ------------------------------------------------------------------
+    # Webcam interactive
+    # ------------------------------------------------------------------
+
     def capture_and_identify_webcam(
         self,
         camera_index: int = 0,
@@ -768,7 +655,6 @@ class SimpleFaceRecognizer:
         if detail is None:
             return None
 
-        # Result board
         board = np.full((420, 720, 3), 40, dtype=np.uint8)
         ref = self.reference_display_bgr(detail)
         if ref is not None:
@@ -821,7 +707,7 @@ def default_cache_dir(data_dir: str) -> Path:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    print("\n--- Face Recognition ---")
+    print("\n--- Face Recognition (deep embeddings) ---")
     base_data_dir = input("Path to 'data' folder [data]: ").strip() or "data"
     known_faces_dir = str(Path(base_data_dir) / "known_faces")
     unknown_face_dir = resolve_unknown_dir(base_data_dir)
@@ -843,7 +729,7 @@ def main() -> None:
                 if name is None:
                     print(f"  {filename}: no face")
                 else:
-                    print(f"  {filename}: {name} (d={conf:.1f})")
+                    print(f"  {filename}: {name} (d={conf:.3f})")
         elif choice == "2":
             img_path = input("Image path: ").strip()
             d = rec.predict_from_image_detail(img_path)
@@ -862,8 +748,8 @@ def main() -> None:
             )
             if rep.get("mean_distance") is not None:
                 print(
-                    f"Mean distance: {rep['mean_distance']:.1f}  "
-                    f"(threshold={rep['threshold']:.1f})"
+                    f"Mean distance: {rep['mean_distance']:.3f}  "
+                    f"(threshold={rep['threshold']:.3f})"
                 )
             for m in rep["mismatches"]:
                 if m.get("reason") == "no_face":
@@ -871,7 +757,7 @@ def main() -> None:
                 else:
                     print(
                         f"  [wrong] {m['file']}  expected={m['expected']}  "
-                        f"predicted={m['predicted']}  d={m['distance']:.1f}"
+                        f"predicted={m['predicted']}  d={m['distance']:.3f}"
                     )
         elif choice == "5":
             m = rec.train_or_load(known_faces_dir, cache_dir=cache_dir, force_retrain=True)
