@@ -5,6 +5,11 @@ A local toolkit for **counting faces** in images and **recognizing** who someone
 > **Local mode:** uploads go only to your Flask process on `127.0.0.1`.  
 > **Deployed mode:** uploads reach that server — HTTPS, access control, and data policies are your responsibility.
 
+
+> **Data:** this repository contains code only. Face photos and test datasets are not included.
+> Add your own images under `data/known_faces/<Name>/` (see [data/known_faces/README.md](data/known_faces/README.md)),
+> and use only photos you have permission to use.
+
 ---
 
 ## What it does

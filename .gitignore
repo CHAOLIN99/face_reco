@@ -14,3 +14,16 @@ env/
 
 # Annotated outputs from face_count CLI
 output/
+
+# Face images and datasets stay local: never commit photos of people
+data/**/*.jpg
+data/**/*.jpeg
+data/**/*.png
+data/unknown_faces/
+image_data/
+frames/
+output_final/
+*.jpg
+*.jpeg
+*.png
+!static/**
